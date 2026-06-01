@@ -51,6 +51,7 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 		mcp.WithString("title", mcp.Required(), mcp.Description("short human title")),
 		mcp.WithString("prompt", mcp.Required(), mcp.Description("the complete self-contained brief for the coding agent")),
 		mcp.WithArray("deps", mcp.Description("slugs of prerequisite tasks"), mcp.Items(map[string]any{"type": "string"})),
+		mcp.WithString("feature", mcp.Description("optional feature slug; when set, the task belongs to that feature and is merged into its branch instead of getting its own PR")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		slug, err := req.RequireString("slug")
 		if err != nil {
@@ -62,11 +63,88 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		deps := req.GetStringSlice("deps", nil)
-		if _, err := st.AddTask(projectID, slug, title, prompt, deps); err != nil {
-			return mcp.NewToolResultErrorf("create_task: %v", err), nil
+		feature := req.GetString("feature", "")
+		if feature == "" {
+			if _, err := st.AddTask(projectID, slug, title, prompt, deps); err != nil {
+				return mcp.NewToolResultErrorf("create_task: %v", err), nil
+			}
+		} else {
+			f, err := st.GetFeature(projectID, feature)
+			if err != nil {
+				return mcp.NewToolResultErrorf("create_task: %v", err), nil
+			}
+			if f == nil {
+				return mcp.NewToolResultErrorf("create_task: no feature %q", feature), nil
+			}
+			if _, err := st.AddTaskToFeature(projectID, f.ID, slug, title, prompt, deps); err != nil {
+				return mcp.NewToolResultErrorf("create_task: %v", err), nil
+			}
 		}
 		logEvent(st, projectID, "create", slug, createSummary(slug, deps))
 		return mcp.NewToolResultText(fmt.Sprintf("created task %q (deps %v)", slug, deps)), nil
+	})
+
+	s.AddTool(mcp.NewTool("create_feature",
+		mcp.WithDescription("Create a feature: a named group of tasks that land together as ONE pull request via a dedicated rambl/feat/<slug> branch. Add tasks to it with create_task(feature=<slug>), then run them all with dispatch_feature."),
+		mcp.WithString("slug", mcp.Required(), mcp.Description("unique kebab-case feature id, e.g. auth")),
+		mcp.WithString("title", mcp.Required(), mcp.Description("short human title")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		slug, err := req.RequireString("slug")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		title, err := req.RequireString("title")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if _, err := st.AddFeature(projectID, slug, title); err != nil {
+			return mcp.NewToolResultErrorf("create_feature: %v", err), nil
+		}
+		logEvent(st, projectID, "create_feature", slug, fmt.Sprintf("created feature %s", slug))
+		return mcp.NewToolResultText(fmt.Sprintf("created feature %q (branch rambl/feat/%s on dispatch)", slug, slug)), nil
+	})
+
+	s.AddTool(mcp.NewTool("dispatch_feature",
+		mcp.WithDescription("Run an entire feature autonomously: dispatches its ready tasks in parallel, squash-merges each completed task into the feature branch in dependency order, runs an integration gate to keep the branch green, and auto-opens the feat→main PR once all tasks are merged and green. Returns immediately; poll feature_status. Requires the feature to exist and have at least one task."),
+		mcp.WithString("slug", mcp.Required(), mcp.Description("feature slug to dispatch")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		slug, err := req.RequireString("slug")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		f, err := st.GetFeature(projectID, slug)
+		if err != nil {
+			return mcp.NewToolResultErrorf("dispatch_feature: %v", err), nil
+		}
+		if f == nil {
+			return mcp.NewToolResultErrorf("dispatch_feature: no feature %q", slug), nil
+		}
+		tasks, err := st.TasksByFeature(projectID, f.ID)
+		if err != nil {
+			return mcp.NewToolResultErrorf("dispatch_feature: %v", err), nil
+		}
+		if len(tasks) == 0 {
+			return mcp.NewToolResultErrorf("dispatch_feature: feature %q has no tasks", slug), nil
+		}
+		go func() {
+			if err := rn.RunFeature(projectID, slug); err != nil {
+				if ff, _ := st.GetFeature(projectID, slug); ff != nil {
+					ff.Status = store.FeatureFailed
+					_ = st.UpdateFeature(ff)
+				}
+				logEvent(st, projectID, "feature", slug, fmt.Sprintf("feature %s failed: %v", slug, err))
+			}
+		}()
+		logEvent(st, projectID, "dispatch_feature", slug, fmt.Sprintf("dispatched feature %s", slug))
+		return mcp.NewToolResultText(fmt.Sprintf("dispatching feature %q; poll feature_status", slug)), nil
+	})
+
+	s.AddTool(mcp.NewTool("feature_status",
+		mcp.WithDescription("Inspect features and their tasks. With a slug, returns that one feature; without, all features. Each feature reports its status (planning/running/integrating/done/failed), branch, and the status of every task under it."),
+		mcp.WithString("slug", mcp.Description("optional feature slug; omit for all")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		slug := req.GetString("slug", "")
+		return featuresJSON(st, projectID, slug)
 	})
 
 	s.AddTool(mcp.NewTool("list_tasks",
@@ -314,6 +392,54 @@ func tasksJSON(st *store.Store, projectID, slug string) (*mcp.CallToolResult, er
 		views = append(views, taskView{
 			Slug: t.Slug, Title: t.Title, Status: string(t.Status), Deps: t.Deps,
 			Branch: t.Branch, Question: t.Question, Result: t.Result,
+		})
+	}
+	data, _ := json.MarshalIndent(views, "", "  ")
+	return mcp.NewToolResultText(string(data)), nil
+}
+
+// featureView is the compact per-feature shape returned to the PM, with its
+// tasks rendered in the same shape as tasksJSON.
+type featureView struct {
+	Slug   string     `json:"slug"`
+	Title  string     `json:"title"`
+	Status string     `json:"status"`
+	Branch string     `json:"branch,omitempty"`
+	Tasks  []taskView `json:"tasks"`
+}
+
+func featuresJSON(st *store.Store, projectID, slug string) (*mcp.CallToolResult, error) {
+	var features []*store.Feature
+	if slug != "" {
+		f, err := st.GetFeature(projectID, slug)
+		if err != nil {
+			return mcp.NewToolResultErrorf("%v", err), nil
+		}
+		if f == nil {
+			return mcp.NewToolResultErrorf("no feature %q", slug), nil
+		}
+		features = []*store.Feature{f}
+	} else {
+		var err error
+		if features, err = st.ListFeatures(projectID); err != nil {
+			return mcp.NewToolResultErrorf("%v", err), nil
+		}
+	}
+	views := make([]featureView, 0, len(features))
+	for _, f := range features {
+		tasks, err := st.TasksByFeature(projectID, f.ID)
+		if err != nil {
+			return mcp.NewToolResultErrorf("%v", err), nil
+		}
+		taskViews := make([]taskView, 0, len(tasks))
+		for _, t := range tasks {
+			taskViews = append(taskViews, taskView{
+				Slug: t.Slug, Title: t.Title, Status: string(t.Status), Deps: t.Deps,
+				Branch: t.Branch, Question: t.Question, Result: t.Result,
+			})
+		}
+		views = append(views, featureView{
+			Slug: f.Slug, Title: f.Title, Status: string(f.Status), Branch: f.Branch, Tasks: taskViews,
 		})
 	}
 	data, _ := json.MarshalIndent(views, "", "  ")

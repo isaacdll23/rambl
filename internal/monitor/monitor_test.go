@@ -104,6 +104,108 @@ func TestBarProportional(t *testing.T) {
 	}
 }
 
+func TestRenderGroupsTasksByFeature(t *testing.T) {
+	now := time.Now()
+	features := []*store.Feature{
+		{ID: "f1", Slug: "alpha", Title: "Alpha", Branch: "rambl/feat/alpha", Status: store.FeatureRunning},
+		{ID: "f2", Slug: "beta", Title: "Beta", Status: store.FeaturePlanning},
+	}
+	tasks := []*store.Task{
+		{Slug: "alpha-one", FeatureID: "f1", Status: store.Running, UpdatedAt: now.Add(-time.Minute)},
+		{Slug: "beta-one", FeatureID: "f2", Status: store.Todo, UpdatedAt: now.Add(-2 * time.Minute)},
+		{Slug: "loose-task", Status: store.Done, UpdatedAt: now.Add(-3 * time.Minute)},
+	}
+
+	out := render(view{
+		name:      "demo",
+		tasks:     tasks,
+		features:  features,
+		startedAt: now.Add(-time.Hour),
+		width:     100,
+		height:    40,
+		animate:   false,
+	})
+
+	wants := []string{
+		"feat",             // a feature header marker
+		"alpha",            // first feature slug
+		"beta",             // second feature slug
+		"standalone",       // standalone header
+		"alpha-one",        // feature task slugs...
+		"beta-one",         //
+		"loose-task",       // ...and the standalone task slug
+		"rambl/feat/alpha", // a feature branch in its header
+	}
+	for _, w := range wants {
+		if !strings.Contains(out, w) {
+			t.Errorf("grouped render missing %q\n---\n%s", w, out)
+		}
+	}
+}
+
+func TestRenderFlatWhenNoFeatures(t *testing.T) {
+	now := time.Now()
+	tasks := []*store.Task{
+		{Slug: "api-routes", Status: store.Running, UpdatedAt: now.Add(-time.Minute)},
+		{Slug: "db-schema", Status: store.Done, UpdatedAt: now.Add(-2 * time.Minute)},
+	}
+	out := render(view{
+		name:      "demo",
+		tasks:     tasks,
+		startedAt: now.Add(-time.Hour),
+		width:     100,
+		height:    40,
+		animate:   false,
+	})
+
+	for _, slug := range []string{"api-routes", "db-schema"} {
+		if !strings.Contains(out, slug) {
+			t.Errorf("flat render missing slug %q\n---\n%s", slug, out)
+		}
+	}
+	if strings.Contains(out, "feat ") {
+		t.Errorf("flat render should have no feature header, got:\n%s", out)
+	}
+	if strings.Contains(out, "standalone") {
+		t.Errorf("flat render should have no standalone header, got:\n%s", out)
+	}
+}
+
+func TestRenderGroupedSelectionOrder(t *testing.T) {
+	now := time.Now()
+	// Features are slug-ordered (alpha, beta). The standalone task sorts first by
+	// task slug ("aaa-standalone") but must still render LAST in grouped order, so
+	// selecting index 0 must expand the first feature's task, not the standalone.
+	features := []*store.Feature{
+		{ID: "f1", Slug: "alpha", Status: store.FeatureRunning},
+		{ID: "f2", Slug: "beta", Status: store.FeatureRunning},
+	}
+	tasks := []*store.Task{
+		{Slug: "aaa-standalone", Status: store.Done, Branch: "feat/loose", UpdatedAt: now.Add(-time.Minute)},
+		{Slug: "alpha-task", FeatureID: "f1", Status: store.Running, Branch: "feat/alpha-task", UpdatedAt: now.Add(-time.Minute)},
+		{Slug: "beta-task", FeatureID: "f2", Status: store.Running, Branch: "feat/beta-task", UpdatedAt: now.Add(-time.Minute)},
+	}
+
+	out := render(view{
+		name:      "demo",
+		tasks:     tasks,
+		features:  features,
+		selected:  0,
+		startedAt: now.Add(-time.Hour),
+		width:     100,
+		height:    40,
+		animate:   false,
+	})
+
+	// Index 0 in grouped order is alpha-task (first feature's first task).
+	if !strings.Contains(out, "branch: feat/alpha-task") {
+		t.Errorf("expected index 0 to expand the first feature's task, got:\n%s", out)
+	}
+	if strings.Contains(out, "branch: feat/loose") {
+		t.Errorf("index 0 should not expand the standalone task, got:\n%s", out)
+	}
+}
+
 // TestSnapshotMode exercises the same path Once() uses (animate=false) end-to-end
 // against a real store, ensuring it renders without animation and includes the
 // worker table plus PM activity.
