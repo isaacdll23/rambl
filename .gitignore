@@ -1,0 +1,12 @@
+# compiled binary
+/rambl
+/defined
+
+# local state (lives in ~/.rambl by default; never commit a DB)
+*.db
+*.db-wal
+*.db-shm
+.rambl/
+
+# os
+.DS_Store

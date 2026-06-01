@@ -1,0 +1,287 @@
+// Package worker is the core abstraction: an autonomous Claude Code worker that
+// owns an isolated git worktree, runs to completion with push-based turn
+// signalling, supports multi-turn follow-ups, and reports its result.
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"rambl/internal/hook"
+	"rambl/internal/session"
+	"rambl/internal/transcript"
+)
+
+// gitMu serialises mutating git operations against the shared repo (concurrent
+// `git worktree add` / branch ops can race on the index lock).
+var gitMu sync.Mutex
+
+// Spec describes a unit of work.
+type Spec struct {
+	ID           string   // task id; used to name the branch and worktree
+	Prompt       string   // the task instruction (first turn)
+	RepoPath     string   // path to the main git repository
+	Base         string   // base ref for the worktree branch (default "HEAD")
+	MergeRefs    []string // refs (dependency branches) merged into the worktree before running
+	SystemPrompt string   // appended to the worker's system prompt (autonomy + outcome protocol)
+}
+
+// Turn is the outcome of one prompt→completion cycle.
+type Turn struct {
+	Reply      string // final assistant text of the turn
+	DurationMs int    // from the transcript's system summary line
+	TimedOut   bool   // true if we fell back to timeout instead of a Stop signal
+}
+
+// Worker manages one worktree-isolated autonomous session.
+type Worker struct {
+	Spec        Spec
+	Branch      string
+	Worktree    string
+	SessionID   string
+	TurnTimeout time.Duration // per-turn cap (default 5m)
+
+	sess     *session.Session
+	tail     *transcript.Tailer
+	hookln   *hook.Listener
+	settings string // generated settings file path
+	cancel   context.CancelFunc
+}
+
+// New builds a worker for spec. selfExe must be the absolute path of this
+// binary (os.Executable()) so the Stop hook can invoke it.
+func New(spec Spec) *Worker {
+	if spec.Base == "" {
+		spec.Base = "HEAD"
+	}
+	return &Worker{Spec: spec, TurnTimeout: 5 * time.Minute}
+}
+
+// Start creates the worktree, wires the Stop-hook socket + settings, starts the
+// transcript tailer, and spawns the autonomous session (ready for Send).
+func (w *Worker) Start(ctx context.Context, selfExe string) error {
+	w.Branch = "rambl/" + w.Spec.ID
+	w.Worktree = filepath.Join(w.Spec.RepoPath, ".rambl", "worktrees", w.Spec.ID)
+
+	if err := os.MkdirAll(filepath.Dir(w.Worktree), 0o755); err != nil {
+		return err
+	}
+	gitMu.Lock()
+	out, err := git(w.Spec.RepoPath, "worktree", "add", "-b", w.Branch, w.Worktree, w.Spec.Base)
+	gitMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("git worktree add: %v: %s", err, out)
+	}
+
+	// Integrate dependency outputs by merging their branches into this
+	// worktree, so a downstream task actually sees upstream code. A conflict is
+	// reported so the orchestrator can mark the task blocked.
+	for _, ref := range w.Spec.MergeRefs {
+		if out, err := gitID(w.Worktree, "merge", "--no-edit", "-m", "rambl: merge "+ref, ref); err != nil {
+			_, _ = gitID(w.Worktree, "merge", "--abort")
+			w.rollback()
+			return fmt.Errorf("merge %s into %s failed (conflict?): %v: %s", ref, w.Spec.ID, err, out)
+		}
+	}
+
+	if w.hookln, err = hook.NewListener(); err != nil {
+		return err
+	}
+	if w.settings, err = writeStopHookSettings(w.hookln.Command(selfExe)); err != nil {
+		return err
+	}
+
+	w.tail = transcript.NewTailer(w.Worktree) // snapshot BEFORE spawning
+	tctx, cancel := context.WithCancel(ctx)
+	w.cancel = cancel
+	go w.tail.Run(tctx)
+
+	args := []string{"--dangerously-skip-permissions"}
+	if w.Spec.SystemPrompt != "" {
+		args = append(args, "--append-system-prompt", w.Spec.SystemPrompt)
+	}
+	cfg := session.Config{
+		Dir:          w.Worktree,
+		ExtraArgs:    args,
+		SettingsPath: w.settings,
+		AcceptBypass: true,
+	}
+	if p := os.Getenv("RAMBL_DEBUG_PTY"); p != "" {
+		if f, ferr := os.Create(p); ferr == nil {
+			cfg.LogWriter = f // tee raw PTY stream for debugging
+		}
+	}
+	w.sess, err = session.Start(cfg)
+	if err != nil {
+		cancel()
+		_ = w.hookln.Close()
+		_ = os.Remove(w.settings)
+		w.rollback() // a failed Start leaves no trace
+		return err
+	}
+	return nil
+}
+
+// rollback removes this worker's worktree and branch (best-effort).
+func (w *Worker) rollback() {
+	gitMu.Lock()
+	defer gitMu.Unlock()
+	_, _ = git(w.Spec.RepoPath, "worktree", "remove", "--force", w.Worktree)
+	_, _ = git(w.Spec.RepoPath, "branch", "-D", w.Branch)
+}
+
+// Commit stages everything in the worktree and commits it to the task branch,
+// so the branch becomes a usable base for dependent tasks. No-op if nothing changed.
+func (w *Worker) Commit(message string) error {
+	if _, err := gitID(w.Worktree, "add", "-A"); err != nil {
+		return err
+	}
+	// Nothing staged → success without an empty commit.
+	if _, err := gitID(w.Worktree, "diff", "--cached", "--quiet"); err == nil {
+		return nil
+	}
+	out, err := gitID(w.Worktree, "commit", "-m", message)
+	if err != nil {
+		return fmt.Errorf("commit: %v: %s", err, out)
+	}
+	return nil
+}
+
+// Run executes the spec's first prompt and returns the resulting turn.
+func (w *Worker) Run(ctx context.Context) (Turn, error) {
+	return w.Send(ctx, w.Spec.Prompt)
+}
+
+// Send issues a prompt and waits for the turn to complete, preferring the Stop
+// hook (push) and falling back to the turn timeout. Safe to call repeatedly for
+// multi-turn follow-ups.
+func (w *Worker) Send(ctx context.Context, prompt string) (Turn, error) {
+	// Drain any stale Stop event so we wait for THIS turn's completion.
+	select {
+	case <-w.hookln.C:
+	default:
+	}
+
+	if err := w.sess.Send(prompt); err != nil {
+		return Turn{}, err
+	}
+
+	var timedOut bool
+	select {
+	case p := <-w.hookln.C:
+		if p.SessionID != "" {
+			w.SessionID = p.SessionID
+		}
+	case <-time.After(w.TurnTimeout):
+		timedOut = true
+	case <-ctx.Done():
+		return Turn{}, ctx.Err()
+	}
+
+	time.Sleep(400 * time.Millisecond) // let the transcript flush after Stop
+	sid, reply, dur := w.tail.Latest()
+	if sid != "" {
+		w.SessionID = sid
+	}
+	return Turn{Reply: reply, DurationMs: dur, TimedOut: timedOut}, nil
+}
+
+// Changes returns a short summary of what the worker did to its worktree
+// (porcelain status plus a diffstat including untracked files).
+func (w *Worker) Changes() (string, error) {
+	if _, err := git(w.Worktree, "add", "-A", "-N"); err != nil { // intent-to-add untracked
+		return "", err
+	}
+	status, err := git(w.Worktree, "status", "--short")
+	if err != nil {
+		return "", err
+	}
+	stat, err := git(w.Worktree, "diff", "--stat")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(status+"\n"+stat, "\n"), nil
+}
+
+// Close ends the session and the tailer. The worktree/branch are left intact
+// for review; call Cleanup to remove them.
+func (w *Worker) Close() error {
+	if w.cancel != nil {
+		w.cancel()
+	}
+	var err error
+	if w.sess != nil {
+		err = w.sess.Close()
+	}
+	if w.hookln != nil {
+		_ = w.hookln.Close()
+	}
+	if w.settings != "" {
+		_ = os.Remove(w.settings)
+	}
+	return err
+}
+
+// Cleanup removes the worktree and its branch. Irreversible — only call once
+// the work has been merged or discarded.
+func (w *Worker) Cleanup() error {
+	gitMu.Lock()
+	defer gitMu.Unlock()
+	if _, err := git(w.Spec.RepoPath, "worktree", "remove", "--force", w.Worktree); err != nil {
+		return err
+	}
+	_, err := git(w.Spec.RepoPath, "branch", "-D", w.Branch)
+	return err
+}
+
+func git(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// gitID runs git with a deterministic identity so merge/commit work in repos
+// that have no configured user.
+func gitID(dir string, args ...string) (string, error) {
+	full := append([]string{
+		"-c", "user.name=rambl", "-c", "user.email=rambl@localhost",
+	}, args...)
+	return git(dir, full...)
+}
+
+// writeStopHookSettings writes a temp settings file registering a Stop hook
+// that runs the given command, and returns its path.
+func writeStopHookSettings(command string) (string, error) {
+	settings := map[string]any{
+		"hooks": map[string]any{
+			"Stop": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": command},
+					},
+				},
+			},
+		},
+	}
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp("", "rambl-settings-*.json")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		return "", err
+	}
+	return f.Name(), nil
+}
