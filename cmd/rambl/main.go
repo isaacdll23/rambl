@@ -13,12 +13,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"rambl/internal/environment"
 	"rambl/internal/hook"
 	"rambl/internal/monitor"
+	"rambl/internal/picker"
 )
 
 // Build metadata, injected via -ldflags by goreleaser at release time.
@@ -39,12 +42,19 @@ func main() {
 		return
 	}
 
-	// Bare `rambl` launches the environment in the current directory.
+	// Bare `rambl` launches the environment at the current repo's toplevel,
+	// or opens the repo picker if the cwd is not inside a git work tree.
 	if len(os.Args) < 2 {
-		check(environment.Run(environment.Options{RepoPath: "."}))
+		if repo := gitToplevel(); repo != "" {
+			check(environment.Run(environment.Options{RepoPath: repo}))
+		} else {
+			launchViaPicker()
+		}
 		return
 	}
 	switch os.Args[1] {
+	case "pick":
+		launchViaPicker()
 	case "pm":
 		pmCmd(os.Args[2:])
 	case "monitor":
@@ -61,6 +71,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   rambl              launch the PM environment in the current directory
+  rambl pick         choose a repo from a TUI, then launch
   rambl pm        -repo <path> [-model <m>]
   rambl monitor   -repo <path> [--once]     (read-only dashboard)
   rambl env-once  -repo <path> -brief <text>  (non-interactive verification)
@@ -115,6 +126,27 @@ func envOnceCmd(argv []string) {
 		fmt.Printf("    %-16s %-11s deps=%v%s\n", t.Slug, t.Status, t.Deps, q)
 	}
 	check(err)
+}
+
+// gitToplevel returns the absolute top-level path of the git work tree the
+// current directory is in, or "" if cwd is not inside a git repository.
+func gitToplevel() string {
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// launchViaPicker opens the repo picker and, unless cancelled, launches the
+// PM environment at the chosen repo.
+func launchViaPicker() {
+	repo, err := picker.Pick(defaultDBPath())
+	check(err)
+	if repo == "" {
+		return // user cancelled
+	}
+	check(environment.Run(environment.Options{RepoPath: repo}))
 }
 
 func defaultDBPath() string {
