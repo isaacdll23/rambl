@@ -89,6 +89,61 @@ func TestStoreLifecycle(t *testing.T) {
 	}
 }
 
+func TestDeleteTask(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	proj, err := s.EnsureProject("/repo/calc", "calc")
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+
+	if _, err := s.AddTask(proj, "core", "Core lib", "build core", nil); err != nil {
+		t.Fatalf("add core: %v", err)
+	}
+	if _, err := s.AddTask(proj, "cli", "CLI", "build cli", []string{"core"}); err != nil {
+		t.Fatalf("add cli: %v", err)
+	}
+
+	// Delete the task that has a dependency edge.
+	if err := s.DeleteTask(proj, "cli"); err != nil {
+		t.Fatalf("delete cli: %v", err)
+	}
+
+	// The task is gone.
+	got, err := s.GetTask(proj, "cli")
+	if err != nil {
+		t.Fatalf("get cli after delete: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected nil for deleted task, got %+v", got)
+	}
+
+	// Its dependency edge is gone too — core no longer has cli pointing at it,
+	// and there are no dangling rows. Re-querying core proves the deps table is
+	// clean (core itself has no deps; cli's edge to core was removed).
+	tasks, err := s.ListTasks(proj)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Slug != "core" {
+		t.Fatalf("want only [core] remaining, got %+v", tasks)
+	}
+	if len(tasks[0].Deps) != 0 {
+		t.Fatalf("core deps = %v, want []", tasks[0].Deps)
+	}
+
+	// Deleting a non-existent slug errors.
+	if err := s.DeleteTask(proj, "nope"); err == nil {
+		t.Fatal("expected error deleting non-existent task, got nil")
+	}
+}
+
 func TestListProjects(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 

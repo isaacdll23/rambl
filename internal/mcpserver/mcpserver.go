@@ -104,6 +104,20 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 		return mcp.NewToolResultText(fmt.Sprintf("sent to %q; poll worker_status", slug)), nil
 	})
 
+	s.AddTool(mcp.NewTool("delete_task",
+		mcp.WithDescription("Permanently delete a task and reclaim its git worktree and branch. Use to prune stale, duplicate, or superseded tasks, or to tidy a task whose work is already merged. Refuses a task that is currently running. This cannot be undone."),
+		mcp.WithString("slug", mcp.Required(), mcp.Description("task slug to delete")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		slug, err := req.RequireString("slug")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if err := rn.Delete(projectID, slug); err != nil {
+			return mcp.NewToolResultErrorf("delete_task: %v", err), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("deleted task %q (worktree and branch reclaimed)", slug)), nil
+	})
+
 	return &Server{mcp: s}
 }
 

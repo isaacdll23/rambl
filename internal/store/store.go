@@ -259,6 +259,31 @@ func (s *Store) GetTask(projectID, slug string) (*Task, error) {
 	return t, nil
 }
 
+// DeleteTask removes a task and its dependency edges. It also removes any
+// dependency edges in which this task is the prerequisite, so no dangling
+// references remain. Returns an error if no such task exists.
+func (s *Store) DeleteTask(projectID, slug string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM tasks WHERE project_id=? AND slug=?`, projectID, slug).Scan(&count); err != nil {
+		return err
+	}
+	if count == 0 {
+		return fmt.Errorf("no task %q", slug)
+	}
+	if _, err := tx.Exec(`DELETE FROM task_deps WHERE project_id=? AND (task_slug=? OR depends_on=?)`, projectID, slug, slug); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM tasks WHERE project_id=? AND slug=?`, projectID, slug); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) depsOf(projectID, slug string) ([]string, error) {
 	rows, err := s.db.Query(`SELECT depends_on FROM task_deps WHERE project_id=? AND task_slug=? ORDER BY depends_on`, projectID, slug)
 	if err != nil {
@@ -293,7 +318,7 @@ func scanTask(sc scanner) (*Task, error) {
 	return t, nil
 }
 
-func now() string         { return iso(time.Now()) }
+func now() string            { return iso(time.Now()) }
 func iso(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 
 // newID returns a random UUIDv4 string (no external dependency).

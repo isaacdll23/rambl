@@ -160,6 +160,28 @@ func (r *Runner) Send(projectID, slug, message string) error {
 	return nil
 }
 
+// Delete retires any live worker for the task, removes its worktree and
+// branch, and deletes the task from the store. Refuses a running task.
+func (r *Runner) Delete(projectID, slug string) error {
+	t, err := r.store.GetTask(projectID, slug)
+	if err != nil {
+		return err
+	}
+	if t == nil {
+		return fmt.Errorf("no task %q", slug)
+	}
+	if t.Status == store.Running {
+		return fmt.Errorf("task %q is running; cannot delete a running task", slug)
+	}
+	r.retire(slug)
+	var worktreePath string
+	if r.worktreeBase != "" {
+		worktreePath = filepath.Join(r.worktreeBase, projectID, slug)
+	}
+	_ = worker.CleanupWorktree(r.repoPath, worktreePath, t.Branch)
+	return r.store.DeleteTask(projectID, slug)
+}
+
 // apply records the outcome of a completed turn and, on completion, commits and
 // retires the worker; on a block it leaves the worker alive for follow-up.
 func (r *Runner) apply(projectID, slug string, w *worker.Worker, turn worker.Turn) {

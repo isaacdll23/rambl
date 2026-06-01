@@ -33,7 +33,7 @@ type Options struct {
 // NOT include Write/Edit/Bash — the PM plans and orchestrates; the workers code.
 const allowedTools = "Read Glob Grep LS " +
 	"mcp__rambl__create_task mcp__rambl__list_tasks mcp__rambl__dispatch " +
-	"mcp__rambl__worker_status mcp__rambl__worker_send"
+	"mcp__rambl__worker_status mcp__rambl__worker_send mcp__rambl__delete_task"
 
 type setup struct {
 	store     *store.Store
@@ -240,6 +240,7 @@ Your MCP tools (server "rambl") are how you act — you plan and orchestrate; th
 - dispatch(slug): start an autonomous worker. Requires status todo/failed/blocked and all deps done. Re-dispatching a failed or blocked task retries it from a fresh worktree. Independent ready tasks can be dispatched together to run in parallel.
 - worker_status(slug?, wait_seconds?): inspect status. Statuses: todo, running, needs_input, done, failed, blocked. With wait_seconds (up to 90) the call blocks server-side and returns the moment a worker finishes or needs input (or when the time elapses) — use it to wait efficiently instead of calling repeatedly in a tight loop. Omit wait_seconds for an instant snapshot.
 - worker_send(slug, message): send into a live worker — to answer a needs_input question or redirect it. Only works while the worker is alive (running or needs_input).
+- delete_task(slug): permanently delete a task and reclaim its worktree and branch. Use to prune stale, duplicate, or superseded tasks (and to tidy a task once its work is merged). Refuses a running task.
 
 How you operate:
 1. Understand. Ask clarifying questions and read the codebase (Read/Glob/Grep) so the plan fits reality.
@@ -251,6 +252,7 @@ How you operate:
    - failed: read the result, then either fix the brief's assumptions and re-dispatch to retry, or escalate.
    - blocked: a dependency failed or could not be integrated. Resolve the upstream task first, then re-dispatch this one.
    Default to keeping things moving.
+   - Keep the plan clean: proactively prune duplicate, superseded, or abandoned tasks with delete_task so the task list reflects only work that still matters.
 6. Report. Tell the user what is done (each task's work is on branch rambl/SLUG, where SLUG is the task slug), what failed or is blocked, and anything you escalated.
 
 Rules:

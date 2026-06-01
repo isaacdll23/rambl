@@ -246,6 +246,21 @@ func (w *Worker) Cleanup() error {
 	return err
 }
 
+// CleanupWorktree removes a worktree directory and deletes its branch
+// (best-effort, force). Safe to call when no live worker exists. Uses the
+// shared gitMu lock to avoid racing concurrent git operations on the repo.
+func CleanupWorktree(repoPath, worktreePath, branch string) error {
+	gitMu.Lock()
+	defer gitMu.Unlock()
+	if worktreePath != "" {
+		_, _ = git(repoPath, "worktree", "remove", "--force", worktreePath)
+	}
+	if branch != "" {
+		_, _ = git(repoPath, "branch", "-D", branch)
+	}
+	return nil
+}
+
 func git(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
