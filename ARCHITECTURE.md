@@ -23,7 +23,8 @@ you ⇄ rambl (the environment, one process)
                create_task → plan into the store
                dispatch    → runner starts a worker
                worker_status / worker_send → monitor + answer blocked workers
-                 └─ runner → autonomous workers (bypass, git worktree each)
+                 └─ runner → autonomous workers (bypass, git worktree each
+                      under ~/.rambl/worktrees/<project>/<slug> — outside the repo)
                       DONE / BLOCKED protocol; dep branches merged in; commit on done
 
 rambl monitor  → separate read-only TUI over the same store (second surface)
@@ -35,7 +36,7 @@ Engine (subscription-safe Claude Code driving):
 - `internal/session` — drive one interactive `claude` under a PTY (no `-p`, no SDK; strips API-key env). Bypass-ack handling, REPL-readiness, prompt submit.
 - `internal/transcript` — tail the session JSONL (source of truth for replies / durationMs).
 - `internal/hook` — push turn-completion via a Stop hook over a unix socket.
-- `internal/worker` — one worktree-isolated autonomous worker: merge dep branches in, run, multi-turn, commit on success.
+- `internal/worker` — one worktree-isolated autonomous worker (worktree lives under `~/.rambl/worktrees/<project>/<slug>`, outside the managed repo, so the repo stays pristine): merge dep branches in, run, multi-turn, commit on success.
 
 PM-driven environment (current architecture):
 - `internal/store` — SQLite state (projects, tasks, deps, status/question/result). WAL for concurrent monitor reads. UUID ids + timestamps (sync-friendly).
@@ -43,11 +44,13 @@ PM-driven environment (current architecture):
 - `internal/mcpserver` — the PM's tools over MCP/HTTP: `create_task`, `list_tasks`, `dispatch`, `worker_status`, `worker_send`.
 - `internal/environment` — boots the MCP server in-process and launches the interactive PM session wired to it (`--mcp-config` + PM prompt + pre-approved tools). Tailor via per-project `.rambl/pm.md`.
 - `internal/monitor` — read-only dashboard (bubbletea) polling the store; `--once` prints a plain snapshot.
+- `internal/picker` — the repo-picker TUI (recent projects + path entry + filesystem browse) used when launching outside a repo.
 
 ## Commands
 
 ```
-rambl                      launch the PM environment in the current repo
+rambl                      launch the PM in the current repo; outside a repo, falls back to the picker
+rambl pick                 choose a repo from a TUI, then launch
 rambl pm        -repo …    explicit environment launch (+ -model)
 rambl monitor   -repo …    read-only dashboard  (--once for a snapshot)
 rambl env-once  -brief …   drive the PM through one brief (verification)
