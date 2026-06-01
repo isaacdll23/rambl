@@ -30,13 +30,13 @@ func stripANSI(b []byte) []byte { return ansiRE.ReplaceAll(b, nil) }
 
 // Config configures a session spawn.
 type Config struct {
-	ClaudePath   string    // resolved if empty
-	Dir          string    // working directory (a trusted folder or a worktree)
-	ExtraArgs    []string  // e.g. {"--dangerously-skip-permissions"}
-	SettingsPath string    // passed as --settings (e.g. our generated Stop-hook settings)
-	AcceptBypass bool       // auto-dismiss the bypass-permissions acknowledgment screen
-	DropEnv      []string  // extra env keys to drop (ANTHROPIC_API_KEY is always dropped)
-	LogWriter    io.Writer // optional: raw PTY stream is teed here for debugging
+	ClaudePath   string        // resolved if empty
+	Dir          string        // working directory (a trusted folder or a worktree)
+	ExtraArgs    []string      // e.g. {"--dangerously-skip-permissions"}
+	SettingsPath string        // passed as --settings (e.g. our generated Stop-hook settings)
+	AcceptBypass bool          // auto-dismiss the bypass-permissions acknowledgment screen
+	DropEnv      []string      // extra env keys to drop (ANTHROPIC_API_KEY is always dropped)
+	LogWriter    io.Writer     // optional: raw PTY stream is teed here for debugging
 	ReadyWait    time.Duration // how long to wait for the REPL after startup/ack (default 4s/3s)
 }
 
@@ -119,7 +119,7 @@ func Start(cfg Config) (*Session, error) {
 var readyMarker = []byte("shift+tab")
 
 func (s *Session) readLoop(ready chan struct{}, acceptBypass bool, logw io.Writer) {
-	var ackOnce, readyOnce sync.Once
+	var ackOnce, trustOnce, readyOnce sync.Once
 	buf := make([]byte, 4096)
 	var acc []byte
 	for {
@@ -131,6 +131,23 @@ func (s *Session) readLoop(ready chan struct{}, acceptBypass bool, logw io.Write
 			acc = append(acc, stripANSI(buf[:n])...)
 			if len(acc) > 32768 {
 				acc = acc[len(acc)-32768:]
+			}
+			// The folder-trust dialog ("Quick safety check: Is this a project you
+			// trust?") is shown for any directory not previously trusted — i.e.
+			// every fresh worktree — and is NOT suppressed by
+			// --dangerously-skip-permissions (it runs before settings load; see
+			// CVE-2026-33068). Its default highlighted option is "Yes, I trust
+			// this folder", so a bare Enter accepts it. We always answer it: this
+			// loop only drives automated, non-interactive sessions, and the
+			// worktrees are derived by git from the user's already-trusted repo.
+			// stripANSI collapses inter-word spaces, so match the contiguous
+			// tokens "safety" + "trust" (both survive stripping).
+			if low := bytes.ToLower(acc); bytes.Contains(low, []byte("safety")) && bytes.Contains(low, []byte("trust")) {
+				trustOnce.Do(func() {
+					time.Sleep(300 * time.Millisecond)
+					_, _ = s.ptmx.Write([]byte("\r")) // accept "Yes, I trust this folder"
+				})
+				acc = acc[:0] // clear so later checks see post-trust output
 			}
 			// The bypass acknowledgment modal ("…Bypass Permissions mode… Yes,
 			// I accept") is shown only the first time per machine; accept it if
