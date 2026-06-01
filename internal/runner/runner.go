@@ -59,7 +59,8 @@ type Runner struct {
 	openFeaturePRFn func(projectID, featureSlug, body string) (string, error)
 
 	mu      sync.Mutex
-	workers map[string]*worker.Worker // keyed by task slug
+	workers map[string]*worker.Worker     // keyed by task slug
+	cancels map[string]context.CancelFunc // per-worker run-cancel, keyed by task slug
 }
 
 // New constructs a Runner. selfExe is this binary's path (for workers' Stop hook).
@@ -74,6 +75,7 @@ func New(st *store.Store, repoPath, base, selfExe, worktreeBase string) *Runner 
 		maxResolveAttempts: 2,
 		pollInterval:       500 * time.Millisecond,
 		workers:            map[string]*worker.Worker{},
+		cancels:            map[string]context.CancelFunc{},
 	}
 }
 
@@ -147,11 +149,25 @@ func (r *Runner) start(projectID, slug, prompt string, mergeRefs []string) {
 		r.fail(projectID, slug, "start: "+err.Error())
 		return
 	}
+	// Make the run cancelable so Stop can terminate it mid-turn; register the
+	// worker and its cancel func together (exactly one place either is set).
+	runCtx, runCancel := context.WithCancel(context.Background())
 	r.mu.Lock()
 	r.workers[slug] = w
+	r.cancels[slug] = runCancel
 	r.mu.Unlock()
 
-	turn, err := w.Run(context.Background())
+	turn, err := w.Run(runCtx)
+
+	// If we were retired out from under us (by Stop or Delete) while blocked in
+	// Run, the terminal status is already set — bow out without clobbering it.
+	r.mu.Lock()
+	_, live := r.workers[slug]
+	r.mu.Unlock()
+	if !live {
+		return
+	}
+
 	if err != nil {
 		r.fail(projectID, slug, "run: "+err.Error())
 		return
@@ -569,6 +585,32 @@ func (r *Runner) Send(projectID, slug, message string) error {
 		r.apply(projectID, slug, w, turn)
 	}()
 	return nil
+}
+
+// Stop terminates a live worker mid-run, marks its task failed (stopped by the
+// PM) leaving the branch intact for re-dispatch, and retires the worker.
+func (r *Runner) Stop(projectID, slug string) error {
+	r.mu.Lock()
+	w := r.workers[slug]
+	if w == nil {
+		r.mu.Unlock()
+		return fmt.Errorf("task %q has no live worker to stop", slug)
+	}
+	delete(r.workers, slug)
+	cancel := r.cancels[slug]
+	delete(r.cancels, slug)
+	r.mu.Unlock()
+
+	if t, _ := r.store.GetTask(projectID, slug); t != nil {
+		t.Status = store.Failed
+		t.Result = "⏹ stopped by PM before completion"
+		t.Question = ""
+		_ = r.store.Update(t)
+	}
+	if cancel != nil {
+		cancel() // unblock start's w.Run; it will see the worker gone and return
+	}
+	return w.Close()
 }
 
 // Delete retires any live worker for the task, removes its worktree and
@@ -1010,6 +1052,7 @@ func (r *Runner) retire(slug string) {
 	r.mu.Lock()
 	w := r.workers[slug]
 	delete(r.workers, slug)
+	delete(r.cancels, slug)
 	r.mu.Unlock()
 	if w != nil {
 		_ = w.Close()
@@ -1020,8 +1063,15 @@ func (r *Runner) retire(slug string) {
 func (r *Runner) Shutdown() {
 	r.mu.Lock()
 	ws := r.workers
+	cancels := r.cancels
 	r.workers = map[string]*worker.Worker{}
+	r.cancels = map[string]context.CancelFunc{}
 	r.mu.Unlock()
+	for _, cancel := range cancels {
+		if cancel != nil {
+			cancel()
+		}
+	}
 	for _, w := range ws {
 		_ = w.Close()
 	}

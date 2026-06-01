@@ -282,6 +282,86 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+// --- 3b. Stop --------------------------------------------------------------
+
+func TestStopNoLiveWorker(t *testing.T) {
+	h := newHarness(t)
+
+	// No live worker registered for the slug -> error mentioning "no live worker".
+	h.addTask("nostop", nil)
+	wantErr(t, h.r.Stop(h.projectID, "nostop"), "no live worker")
+
+	// Unknown slug likewise has no live worker.
+	wantErr(t, h.r.Stop(h.projectID, "ghost"), "no live worker")
+}
+
+// TestStopBookkeeping registers an (unstarted) worker plus a cancel func directly
+// into the runner's maps — the same seam start uses — then asserts Stop marks the
+// task Failed with the stopped result, fires the cancel func, and removes the slug
+// from both r.workers and r.cancels. A real spawned session is impractical in the
+// hermetic harness (no claude binary), so this exercises the post-Stop state and
+// map cleanup via the most direct seam, mirroring the existing tests' approach.
+func TestStopBookkeeping(t *testing.T) {
+	h := newHarness(t)
+
+	h.addTask("stopme", nil)
+	h.mutate("stopme", func(tk *store.Task) {
+		tk.Status = store.Running
+		tk.Branch = "rambl/stopme"
+		tk.Question = "an in-flight question"
+	})
+
+	// Register a worker + cancel func exactly as start would, so Stop has a live
+	// worker to terminate. The worker is never Started, so Close is a safe no-op.
+	w := worker.New(worker.Spec{ID: "stopme", RepoPath: h.repo})
+	canceled := false
+	cancel := func() { canceled = true }
+	h.r.mu.Lock()
+	h.r.workers["stopme"] = w
+	h.r.cancels["stopme"] = cancel
+	h.r.mu.Unlock()
+
+	if err := h.r.Stop(h.projectID, "stopme"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// Task is now a re-dispatchable terminal state with the stopped result.
+	tk := h.get("stopme")
+	if tk.Status != store.Failed {
+		t.Errorf("status = %q, want %q", tk.Status, store.Failed)
+	}
+	if !strings.Contains(tk.Result, "stopped by PM") {
+		t.Errorf("result = %q, want it to mention 'stopped by PM'", tk.Result)
+	}
+	if tk.Question != "" {
+		t.Errorf("question = %q, want it cleared", tk.Question)
+	}
+	// Branch left intact for re-dispatch.
+	if tk.Branch != "rambl/stopme" {
+		t.Errorf("branch = %q, want it preserved as rambl/stopme", tk.Branch)
+	}
+
+	// The cancel func fired (unblocking start's w.Run).
+	if !canceled {
+		t.Errorf("expected Stop to call the worker's cancel func")
+	}
+
+	// Both maps no longer hold the slug.
+	h.r.mu.Lock()
+	_, hasWorker := h.r.workers["stopme"]
+	_, hasCancel := h.r.cancels["stopme"]
+	h.r.mu.Unlock()
+	if hasWorker {
+		t.Errorf("r.workers still holds %q after Stop", "stopme")
+	}
+	if hasCancel {
+		t.Errorf("r.cancels still holds %q after Stop", "stopme")
+	}
+
+	// Failed is re-dispatchable: a second Stop now finds no live worker.
+	wantErr(t, h.r.Stop(h.projectID, "stopme"), "no live worker")
+}
+
 // --- 4. Diff ---------------------------------------------------------------
 
 func TestDiff(t *testing.T) {
