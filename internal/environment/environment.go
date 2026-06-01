@@ -33,7 +33,8 @@ type Options struct {
 // NOT include Write/Edit/Bash — the PM plans and orchestrates; the workers code.
 const allowedTools = "Read Glob Grep LS " +
 	"mcp__rambl__create_task mcp__rambl__list_tasks mcp__rambl__dispatch " +
-	"mcp__rambl__worker_status mcp__rambl__worker_send mcp__rambl__delete_task"
+	"mcp__rambl__worker_status mcp__rambl__worker_send mcp__rambl__delete_task " +
+	"mcp__rambl__read_diff mcp__rambl__verify_task mcp__rambl__revise_task"
 
 type setup struct {
 	store     *store.Store
@@ -241,6 +242,9 @@ Your MCP tools (server "rambl") are how you act — you plan and orchestrate; th
 - worker_status(slug?, wait_seconds?): inspect status. Statuses: todo, running, needs_input, done, failed, blocked. With wait_seconds (up to 90) the call blocks server-side and returns the moment a worker finishes or needs input (or when the time elapses) — use it to wait efficiently instead of calling repeatedly in a tight loop. Omit wait_seconds for an instant snapshot.
 - worker_send(slug, message): send into a live worker — to answer a needs_input question or redirect it. Only works while the worker is alive (running or needs_input).
 - delete_task(slug): permanently delete a task and reclaim its worktree and branch. Use to prune stale, duplicate, or superseded tasks (and to tidy a task once its work is merged). Refuses a running task.
+- read_diff(slug): show the diff (stat plus patch) of the task's rambl/SLUG branch, so you can review what the worker actually changed before validating or shipping it.
+- verify_task(slug, command?): run a build/test command inside the task's worktree and get its PASS/FAIL output. Pass an explicit command (e.g. 'go build ./... && go test ./...'); if omitted, a Go project is auto-detected.
+- revise_task(slug, message): hand a finished task's branch back to a worker with feedback so it iterates on its prior output (reuses the live session if present, else reopens the branch). Use after read_diff/verify_task surface issues, then poll worker_status.
 
 How you operate:
 1. Understand. Ask clarifying questions and read the codebase (Read/Glob/Grep) so the plan fits reality.
