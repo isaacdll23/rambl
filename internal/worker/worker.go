@@ -96,9 +96,7 @@ func (w *Worker) Start(ctx context.Context, selfExe string) error {
 		if err := os.MkdirAll(filepath.Dir(w.Worktree), 0o755); err != nil {
 			return err
 		}
-		gitMu.Lock()
-		out, err := git(w.Spec.RepoPath, "worktree", "add", "-b", w.Branch, w.Worktree, w.Spec.Base)
-		gitMu.Unlock()
+		out, err := ensureWorktree(w.Spec.RepoPath, w.Worktree, w.Branch, w.Spec.Base)
 		if err != nil {
 			return fmt.Errorf("git worktree add: %v: %s", err, out)
 		}
@@ -152,6 +150,41 @@ func (w *Worker) Start(ctx context.Context, selfExe string) error {
 		return err
 	}
 	return nil
+}
+
+// ensureWorktree creates branch from base in a new worktree at worktreePath:
+//
+//	git worktree add -b <branch> <worktreePath> <base>
+//
+// If that fails because a stale worktree dir and/or branch from a prior
+// interrupted run already exist, it reclaims them (worktree remove --force,
+// worktree prune, branch -D) and retries the add exactly once. Serialised on
+// gitMu. Returns the final git output and error. base "" is treated as "HEAD".
+func ensureWorktree(repoPath, worktreePath, branch, base string) (string, error) {
+	if base == "" {
+		base = "HEAD"
+	}
+	gitMu.Lock()
+	defer gitMu.Unlock()
+
+	out, err := git(repoPath, "worktree", "add", "-b", branch, worktreePath, base)
+	if err == nil {
+		return out, nil
+	}
+	// Only reclaim when the failure is a stale worktree/branch left by a prior
+	// interrupted run; any other error surfaces unchanged.
+	lc := strings.ToLower(out)
+	reclaimable := strings.Contains(lc, "already exists") ||
+		strings.Contains(lc, "already used by worktree") ||
+		strings.Contains(lc, "already checked out")
+	if !reclaimable {
+		return out, err
+	}
+	// Reclaim and retry exactly once (all best-effort).
+	_, _ = git(repoPath, "worktree", "remove", "--force", worktreePath)
+	_, _ = git(repoPath, "worktree", "prune")
+	_, _ = git(repoPath, "branch", "-D", branch)
+	return git(repoPath, "worktree", "add", "-b", branch, worktreePath, base)
 }
 
 // rollback removes this worker's worktree and branch (best-effort).
