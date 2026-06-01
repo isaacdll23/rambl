@@ -148,6 +148,96 @@ func TestReopenMissingWorktree(t *testing.T) {
 	}
 }
 
+// TestCommitUsesConfiguredIdentity verifies that when the repo has a configured
+// git identity, worker commits are authored as that user — NOT the synthetic
+// rambl@localhost fallback.
+func TestCommitUsesConfiguredIdentity(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		if out, err := git(repo, args...); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	run("init")
+	// A specific local identity that must be honoured by the commit.
+	run("config", "user.email", "alice@example.com")
+	run("config", "user.name", "Alice")
+
+	if !hasGitIdentity(repo) {
+		t.Fatalf("hasGitIdentity should be true with local identity set")
+	}
+
+	w := &Worker{Worktree: repo}
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("a\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Commit("alice change"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	out, err := git(repo, "log", "-1", "--format=%ae")
+	if err != nil {
+		t.Fatalf("git log: %v: %s", err, out)
+	}
+	if got := strings.TrimSpace(out); got != "alice@example.com" {
+		t.Errorf("commit author email = %q, want alice@example.com", got)
+	}
+}
+
+// TestHasGitIdentityNoConfig checks the no-identity fallback path: with global
+// and system config isolated and no local identity, hasGitIdentity is false and
+// gitID then injects the synthetic rambl identity so commits still succeed.
+func TestHasGitIdentityNoConfig(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+
+	// Isolate config sources so only the (empty) local config is consulted.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+	t.Setenv("HOME", repo)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(repo, ".config"))
+	// Unset any ambient identity env vars (an empty value would override the
+	// -c fallback and break the commit). t.Setenv registers cleanup; clear after.
+	for _, k := range []string{"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"} {
+		t.Setenv(k, "")
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatalf("unsetenv %s: %v", k, err)
+		}
+	}
+
+	if out, err := git(repo, "init"); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+
+	if hasGitIdentity(repo) {
+		t.Skip("environment has an ambient git identity; cannot exercise no-config fallback here")
+	}
+
+	// gitID must inject the rambl fallback so a commit still succeeds.
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if out, err := gitID(repo, "add", "-A"); err != nil {
+		t.Fatalf("add: %v: %s", err, out)
+	}
+	if out, err := gitID(repo, "commit", "-m", "fallback"); err != nil {
+		t.Fatalf("commit with fallback identity should succeed: %v: %s", err, out)
+	}
+	out, err := git(repo, "log", "-1", "--format=%ae")
+	if err != nil {
+		t.Fatalf("git log: %v: %s", err, out)
+	}
+	if got := strings.TrimSpace(out); got != "rambl@localhost" {
+		t.Errorf("fallback commit author email = %q, want rambl@localhost", got)
+	}
+}
+
 func TestDiffBranch(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")

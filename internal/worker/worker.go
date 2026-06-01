@@ -297,13 +297,24 @@ func git(dir string, args ...string) (string, error) {
 	return string(out), err
 }
 
-// gitID runs git with a deterministic identity so merge/commit work in repos
-// that have no configured user.
+// gitID runs git, falling back to a deterministic synthetic identity ONLY when
+// the repo at dir has no git user configured. When the repo already has an
+// identity (the human's, inherited by the worktree), commits are authored as
+// that user — so squash-merges don't credit a synthetic "rambl" co-author.
 func gitID(dir string, args ...string) (string, error) {
-	full := append([]string{
-		"-c", "user.name=rambl", "-c", "user.email=rambl@localhost",
-	}, args...)
-	return git(dir, full...)
+	var prefix []string
+	if !hasGitIdentity(dir) {
+		prefix = []string{"-c", "user.name=rambl", "-c", "user.email=rambl@localhost"}
+	}
+	return git(dir, append(prefix, args...)...)
+}
+
+// hasGitIdentity reports whether dir has both user.name and user.email set.
+func hasGitIdentity(dir string) bool {
+	name, errN := git(dir, "config", "user.name")
+	email, errE := git(dir, "config", "user.email")
+	return errN == nil && errE == nil &&
+		strings.TrimSpace(name) != "" && strings.TrimSpace(email) != ""
 }
 
 // writeStopHookSettings writes a temp settings file registering a Stop hook
