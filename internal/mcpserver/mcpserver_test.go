@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"testing"
+	"time"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -101,6 +102,66 @@ func TestMCPToolsOverHTTP(t *testing.T) {
 	}
 	if len(cliDeps) != 1 || cliDeps[0] != "core" {
 		t.Fatalf("cli deps = %v, want [core]", cliDeps)
+	}
+}
+
+// TestWorkerStatusWait covers the bounded long-poll: wait_seconds=0 is an
+// instant read, a settled (done) scope returns promptly, and an only-running
+// scope blocks to roughly the cap.
+func TestWorkerStatusWait(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	proj, err := st.EnsureProject("/repo/calc", "calc")
+	if err != nil {
+		t.Fatalf("project: %v", err)
+	}
+	done, err := st.AddTask(proj, "done-task", "Done", "x", nil)
+	if err != nil {
+		t.Fatalf("add done-task: %v", err)
+	}
+	done.Status = store.Done
+	if err := st.Update(done); err != nil {
+		t.Fatalf("update done-task: %v", err)
+	}
+	run, err := st.AddTask(proj, "run-task", "Run", "x", nil)
+	if err != nil {
+		t.Fatalf("add run-task: %v", err)
+	}
+	run.Status = store.Running
+	if err := st.Update(run); err != nil {
+		t.Fatalf("update run-task: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// wait_seconds=0 → instant read regardless of scope.
+	start := time.Now()
+	waitForStatusIf(ctx, st, proj, "run-task", 0)
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("wait_seconds=0 took %v, want instant", d)
+	}
+
+	// Settled (done) scope returns well under the cap even with a wait set.
+	start = time.Now()
+	waitForStatus(ctx, st, proj, "done-task", 2)
+	if d := time.Since(start); d > 1500*time.Millisecond {
+		t.Fatalf("settled scope took %v, want early return", d)
+	}
+
+	// Only-running scope blocks to roughly the cap.
+	start = time.Now()
+	waitForStatus(ctx, st, proj, "run-task", 2)
+	if d := time.Since(start); d < 1500*time.Millisecond {
+		t.Fatalf("running scope returned in %v, want ~cap", d)
+	}
+}
+
+// waitForStatusIf mirrors the handler's gate: only block when wait > 0.
+func waitForStatusIf(ctx context.Context, st *store.Store, projectID, slug string, wait int) {
+	if wait > 0 {
+		waitForStatus(ctx, st, projectID, slug, wait)
 	}
 }
 

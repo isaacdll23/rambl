@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -15,6 +16,9 @@ import (
 	"rambl/internal/runner"
 	"rambl/internal/store"
 )
+
+// maxWaitSeconds caps how long worker_status will block server-side.
+const maxWaitSeconds = 90
 
 // Server wraps the MCP server for one project.
 type Server struct {
@@ -69,10 +73,16 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 	})
 
 	s.AddTool(mcp.NewTool("worker_status",
-		mcp.WithDescription("Check worker/task status. With a slug, returns that task; without, returns all. A task in 'needs_input' has a 'question' you should answer (from your own knowledge if possible) via worker_send, or escalate to the human."),
+		mcp.WithDescription("Check worker/task status. With a slug, returns that task; without, returns all. A task in 'needs_input' has a 'question' you should answer (from your own knowledge if possible) via worker_send, or escalate to the human. With wait_seconds > 0, blocks server-side and returns early as soon as a watched task finishes or needs input."),
 		mcp.WithString("slug", mcp.Description("optional task slug; omit for all")),
+		mcp.WithNumber("wait_seconds", mcp.Description("optional: block up to this many seconds (max 90), returning as soon as a watched task finishes or needs input; omit/0 for an instant snapshot")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		return tasksJSON(st, projectID, req.GetString("slug", ""))
+		slug := req.GetString("slug", "")
+		wait := req.GetInt("wait_seconds", 0)
+		if wait > 0 {
+			waitForStatus(ctx, st, projectID, slug, wait)
+		}
+		return tasksJSON(st, projectID, slug)
 	})
 
 	s.AddTool(mcp.NewTool("worker_send",
@@ -100,6 +110,68 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 // Serve runs the MCP server over streamable HTTP at addr (endpoint /mcp).
 func (s *Server) Serve(addr string) error {
 	return server.NewStreamableHTTPServer(s.mcp).Start(addr)
+}
+
+// waitForStatus blocks up to min(wait, maxWaitSeconds) seconds, polling the
+// store about once a second, and returns as soon as the watched scope is
+// settled-or-needs-attention, the deadline elapses, or ctx is cancelled.
+func waitForStatus(ctx context.Context, st *store.Store, projectID, slug string, wait int) {
+	if wait > maxWaitSeconds {
+		wait = maxWaitSeconds
+	}
+	// Check immediately so an already-settled scope returns without a sleep.
+	if settledOrNeedsAttention(st, projectID, slug) {
+		return
+	}
+	deadline := time.After(time.Duration(wait) * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline:
+			return
+		case <-ticker.C:
+			if settledOrNeedsAttention(st, projectID, slug) {
+				return
+			}
+		}
+	}
+}
+
+// settledOrNeedsAttention reports whether the watched scope has reached a state
+// worth returning early for. With a slug: that one task is done/failed/blocked/
+// needs_input. Without: any task needs_input or failed, or every task is
+// done/failed/blocked (nothing left running or todo).
+func settledOrNeedsAttention(st *store.Store, projectID, slug string) bool {
+	if slug != "" {
+		t, err := st.GetTask(projectID, slug)
+		if err != nil || t == nil {
+			return false
+		}
+		switch t.Status {
+		case store.Done, store.Failed, store.Blocked, store.NeedsInput:
+			return true
+		}
+		return false
+	}
+	tasks, err := st.ListTasks(projectID)
+	if err != nil || len(tasks) == 0 {
+		return false
+	}
+	allSettled := true
+	for _, t := range tasks {
+		if t.Status == store.NeedsInput || t.Status == store.Failed {
+			return true
+		}
+		switch t.Status {
+		case store.Done, store.Failed, store.Blocked:
+		default:
+			allSettled = false
+		}
+	}
+	return allSettled
 }
 
 // taskView is the compact per-task shape returned to the PM.
