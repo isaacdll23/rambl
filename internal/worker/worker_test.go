@@ -124,6 +124,81 @@ func TestCleanupWorktreeBestEffort(t *testing.T) {
 	}
 }
 
+func TestEnsureWorktreeFresh(t *testing.T) {
+	repo := newRepo(t)
+	wtPath := filepath.Join(t.TempDir(), "wt")
+
+	out, err := ensureWorktree(repo, wtPath, "rambl/x", "HEAD")
+	if err != nil {
+		t.Fatalf("ensureWorktree: %v: %s", err, out)
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Fatalf("worktree should exist after add: %v", err)
+	}
+	// Populated from base (file.txt from newRepo).
+	if _, err := os.Stat(filepath.Join(wtPath, "file.txt")); err != nil {
+		t.Errorf("worktree should be populated from base (file.txt missing): %v", err)
+	}
+	if !BranchExists(repo, "rambl/x") {
+		t.Errorf("BranchExists should be true after ensureWorktree")
+	}
+}
+
+func TestEnsureWorktreeReclaimsStaleBranchAndWorktree(t *testing.T) {
+	repo := newRepo(t)
+	wtPath := filepath.Join(t.TempDir(), "wt")
+
+	// First creation succeeds.
+	if out, err := ensureWorktree(repo, wtPath, "rambl/x", "HEAD"); err != nil {
+		t.Fatalf("first ensureWorktree: %v: %s", err, out)
+	}
+
+	// Second call with the SAME branch + worktree path must reclaim and succeed.
+	// (Without the fix this fails with "already exists".)
+	if out, err := ensureWorktree(repo, wtPath, "rambl/x", "HEAD"); err != nil {
+		t.Fatalf("second ensureWorktree should reclaim: %v: %s", err, out)
+	}
+	if !BranchExists(repo, "rambl/x") {
+		t.Errorf("branch rambl/x should still exist after reclaim")
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Errorf("worktree dir should exist after reclaim: %v", err)
+	}
+}
+
+func TestEnsureWorktreeReclaimsStaleBranchOnly(t *testing.T) {
+	repo := newRepo(t)
+
+	// A dangling branch with no associated worktree.
+	if out, err := gitID(repo, "branch", "rambl/y", "HEAD"); err != nil {
+		t.Fatalf("branch: %v: %s", err, out)
+	}
+	if !BranchExists(repo, "rambl/y") {
+		t.Fatalf("branch rambl/y should exist before ensureWorktree")
+	}
+
+	wtPath := filepath.Join(t.TempDir(), "wt")
+	if out, err := ensureWorktree(repo, wtPath, "rambl/y", "HEAD"); err != nil {
+		t.Fatalf("ensureWorktree should reclaim dangling branch: %v: %s", err, out)
+	}
+	if !BranchExists(repo, "rambl/y") {
+		t.Errorf("branch rambl/y should exist after reclaim")
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Errorf("worktree dir should exist after reclaim: %v", err)
+	}
+}
+
+func TestEnsureWorktreeRealErrorNotRetried(t *testing.T) {
+	repo := newRepo(t)
+	wtPath := filepath.Join(t.TempDir(), "wt")
+
+	// A bad base is not a reclaimable conflict, so the error surfaces.
+	if _, err := ensureWorktree(repo, wtPath, "rambl/z", "definitely-not-a-ref"); err == nil {
+		t.Errorf("ensureWorktree with a bad base should error")
+	}
+}
+
 func TestPushBranch(t *testing.T) {
 	source := newRepo(t)
 	run := func(args ...string) {
