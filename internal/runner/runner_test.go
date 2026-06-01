@@ -2,10 +2,12 @@ package runner
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"rambl/internal/store"
@@ -825,6 +827,225 @@ func slugs(tasks []*store.Task) []string {
 		out[i] = t.Slug
 	}
 	return out
+}
+
+// --- DAG scheduler ----------------------------------------------------------
+
+// gitRun runs a git subcommand returning an error (safe to call off the test
+// goroutine, unlike runGit which calls t.Fatalf).
+func gitRun(dir string, args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git %s (in %s): %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+	return nil
+}
+
+// fakeRunTask returns a runTask override that drives scheduling without spawning
+// real Claude sessions. For each dispatched slug it records the dispatch order
+// and, unless statuses[slug] overrides it to a non-Done status, creates branch
+// rambl/<slug> off the CURRENT feature branch tip with a unique committed file
+// and marks the task Done. Serialised so concurrent waves don't race the repo.
+func (h *harness) fakeRunTask(featureSlug string, statuses map[string]store.Status, order *[]string) func(string, string) (store.Status, error) {
+	var mu sync.Mutex
+	return func(projectID, slug string) (store.Status, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if order != nil {
+			*order = append(*order, slug)
+		}
+		st := store.Done
+		if s, ok := statuses[slug]; ok {
+			st = s
+		}
+		if st != store.Done {
+			return st, nil
+		}
+		dir, err := os.MkdirTemp("", "rambl-fake-")
+		if err != nil {
+			return store.Failed, err
+		}
+		wt := filepath.Join(dir, slug)
+		if err := gitRun(h.repo, "worktree", "add", "-b", "rambl/"+slug, wt, featureBranch(featureSlug)); err != nil {
+			return store.Failed, err
+		}
+		if err := os.WriteFile(filepath.Join(wt, slug+".txt"), []byte(slug+"\n"), 0o644); err != nil {
+			return store.Failed, err
+		}
+		if err := gitRun(wt, "add", "-A"); err != nil {
+			return store.Failed, err
+		}
+		if err := gitRun(wt, "commit", "-m", "work "+slug); err != nil {
+			return store.Failed, err
+		}
+		_ = gitRun(h.repo, "worktree", "remove", "--force", wt)
+
+		tk, err := h.st.GetTask(projectID, slug)
+		if err != nil {
+			return store.Failed, err
+		}
+		tk.Status = store.Done
+		tk.Branch = "rambl/" + slug
+		if err := h.st.Update(tk); err != nil {
+			return store.Failed, err
+		}
+		return store.Done, nil
+	}
+}
+
+func TestDispatchableFeatureTasks(t *testing.T) {
+	h := newHarness(t)
+	f, err := h.st.AddFeature(h.projectID, "feat", "Feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	for _, tc := range []struct {
+		slug string
+		deps []string
+	}{{"a", nil}, {"b", []string{"a"}}, {"c", []string{"a"}}} {
+		if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, tc.slug, tc.slug+" title", "do "+tc.slug, tc.deps); err != nil {
+			t.Fatalf("AddTaskToFeature %q: %v", tc.slug, err)
+		}
+	}
+
+	ready, err := h.r.DispatchableFeatureTasks(h.projectID, "feat", map[string]bool{})
+	if err != nil {
+		t.Fatalf("DispatchableFeatureTasks: %v", err)
+	}
+	if got := slugs(ready); !equalStrings(got, []string{"a"}) {
+		t.Errorf("merged={} dispatchable = %v, want [a]", got)
+	}
+
+	// Once a is done+merged it drops out, and its dependents b, c become ready.
+	h.mutate("a", func(tk *store.Task) { tk.Status = store.Done })
+	ready, err = h.r.DispatchableFeatureTasks(h.projectID, "feat", map[string]bool{"a": true})
+	if err != nil {
+		t.Fatalf("DispatchableFeatureTasks: %v", err)
+	}
+	if got := slugs(ready); !equalStrings(got, []string{"b", "c"}) {
+		t.Errorf("merged={a} dispatchable = %v, want [b c]", got)
+	}
+
+	// A task already non-Todo is excluded even when its deps are satisfied.
+	h.mutate("b", func(tk *store.Task) { tk.Status = store.Running })
+	ready, err = h.r.DispatchableFeatureTasks(h.projectID, "feat", map[string]bool{"a": true})
+	if err != nil {
+		t.Fatalf("DispatchableFeatureTasks: %v", err)
+	}
+	if got := slugs(ready); !equalStrings(got, []string{"c"}) {
+		t.Errorf("after b->Running, merged={a} dispatchable = %v, want [c]", got)
+	}
+
+	// Unknown feature -> error.
+	_, err = h.r.DispatchableFeatureTasks(h.projectID, "ghost", map[string]bool{})
+	wantErr(t, err, "no feature")
+}
+
+// featureCommitSubjects returns the subjects of the N commits on top of the
+// feature branch's base (newest first).
+func featureCommitSubjects(t *testing.T, h *harness, featureSlug string, n int) []string {
+	t.Helper()
+	out := runGit(t, h.repo, "log", "--format=%s", "-n", fmt.Sprint(n), featureBranch(featureSlug))
+	return strings.Split(strings.TrimSpace(out), "\n")
+}
+
+func TestRunFeatureHappyPath(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	f, err := h.st.AddFeature(h.projectID, "feat", "Feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	for _, slug := range []string{"t1", "t2"} {
+		if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, slug, slug, "do "+slug, nil); err != nil {
+			t.Fatalf("AddTaskToFeature %q: %v", slug, err)
+		}
+	}
+	h.r.runTask = h.fakeRunTask("feat", nil, nil)
+
+	if err := h.r.RunFeature(h.projectID, "feat"); err != nil {
+		t.Fatalf("RunFeature: %v", err)
+	}
+
+	// Two merge commits, newest-first: t2 then t1 (merged in ascending slug order).
+	subj := featureCommitSubjects(t, h, "feat", 2)
+	if len(subj) != 2 {
+		t.Fatalf("expected 2 commits, got %d: %v", len(subj), subj)
+	}
+	if !strings.HasPrefix(subj[1], "feat(t1):") {
+		t.Errorf("oldest commit = %q, want feat(t1): prefix", subj[1])
+	}
+	if !strings.HasPrefix(subj[0], "feat(t2):") {
+		t.Errorf("newest commit = %q, want feat(t2): prefix", subj[0])
+	}
+}
+
+func TestRunFeatureDependencyOrder(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	f, err := h.st.AddFeature(h.projectID, "feat", "Feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "base", "base", "do base", nil); err != nil {
+		t.Fatalf("AddTaskToFeature base: %v", err)
+	}
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "dependent", "dependent", "do dependent", []string{"base"}); err != nil {
+		t.Fatalf("AddTaskToFeature dependent: %v", err)
+	}
+	var order []string
+	h.r.runTask = h.fakeRunTask("feat", nil, &order)
+
+	if err := h.r.RunFeature(h.projectID, "feat"); err != nil {
+		t.Fatalf("RunFeature: %v", err)
+	}
+
+	if !equalStrings(order, []string{"base", "dependent"}) {
+		t.Errorf("dispatch order = %v, want [base dependent]", order)
+	}
+	subj := featureCommitSubjects(t, h, "feat", 2)
+	if len(subj) != 2 || !strings.HasPrefix(subj[1], "feat(base):") || !strings.HasPrefix(subj[0], "feat(dependent):") {
+		t.Errorf("commit subjects = %v, want [feat(dependent):..., feat(base):...]", subj)
+	}
+}
+
+func TestRunFeatureTaskFailure(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	f, err := h.st.AddFeature(h.projectID, "feat", "Feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "good", "good", "do good", nil); err != nil {
+		t.Fatalf("AddTaskToFeature good: %v", err)
+	}
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "bad", "bad", "do bad", nil); err != nil {
+		t.Fatalf("AddTaskToFeature bad: %v", err)
+	}
+	h.r.runTask = h.fakeRunTask("feat", map[string]store.Status{"bad": store.Failed}, nil)
+
+	err = h.r.RunFeature(h.projectID, "feat")
+	wantErr(t, err, "did not complete")
+	wantErr(t, err, "bad")
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestTopoOrder(t *testing.T) {
