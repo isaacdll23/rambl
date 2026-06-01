@@ -4,6 +4,7 @@
 //	rambl pm         explicit environment launch (with flags)
 //	rambl monitor    read-only worker dashboard (--once for a snapshot)
 //	rambl env-once   drive the PM through one brief, non-interactively (verification)
+//	rambl doctor     environment preflight check (claude CLI, git, ~/.rambl)
 //	rambl version    print version, commit, and build date
 //
 // Plus the hidden `__hook` subcommand, invoked by each worker's Stop hook.
@@ -18,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"rambl/internal/doctor"
 	"rambl/internal/environment"
 	"rambl/internal/hook"
 	"rambl/internal/monitor"
@@ -61,6 +63,8 @@ func main() {
 		monitorCmd(os.Args[2:])
 	case "env-once":
 		envOnceCmd(os.Args[2:])
+	case "doctor":
+		doctorCmd()
 	case "version", "-v", "--version":
 		fmt.Printf("rambl %s (commit %s, built %s)\n", Version, Commit, BuildDate)
 	default:
@@ -75,6 +79,7 @@ func usage() {
   rambl pm        -repo <path> [-model <m>]
   rambl monitor   -repo <path> [--once]     (read-only dashboard)
   rambl env-once  -repo <path> -brief <text>  (non-interactive verification)
+  rambl doctor       check the environment (claude CLI, git, ~/.rambl)
   rambl version                             (print version info)`)
 	os.Exit(2)
 }
@@ -126,6 +131,16 @@ func envOnceCmd(argv []string) {
 		fmt.Printf("    %-16s %-11s deps=%v%s\n", t.Slug, t.Status, t.Deps, q)
 	}
 	check(err)
+}
+
+// doctorCmd runs the environment preflight checks and prints the results,
+// exiting non-zero if any check failed.
+func doctorCmd() {
+	results := doctor.Run(doctor.Checks())
+	fmt.Print(doctor.RenderText(results))
+	if doctor.HasFailure(results) {
+		os.Exit(1)
+	}
 }
 
 // gitToplevel returns the absolute top-level path of the git work tree the
