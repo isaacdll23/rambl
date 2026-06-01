@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"rambl/internal/store"
+	"rambl/internal/worker"
 )
 
 // --- test helpers ----------------------------------------------------------
@@ -498,4 +499,98 @@ func TestOpenPRGhStep(t *testing.T) {
 
 	_, err := h.r.OpenPR(h.projectID, "prgh", "title", "body")
 	wantErr(t, err, "gh pr create failed")
+}
+
+// --- feature lifecycle ------------------------------------------------------
+
+func TestStartFeatureAndTaskBase(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+
+	f, err := h.st.AddFeature(h.projectID, "auth", "Auth feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+
+	got, err := h.r.StartFeature(h.projectID, "auth")
+	if err != nil {
+		t.Fatalf("StartFeature: %v", err)
+	}
+	if got.Branch != "rambl/feat/auth" {
+		t.Errorf("feature branch = %q, want rambl/feat/auth", got.Branch)
+	}
+	if got.Status != store.FeatureRunning {
+		t.Errorf("feature status = %q, want %q", got.Status, store.FeatureRunning)
+	}
+
+	// Persisted to the store.
+	reloaded, err := h.st.GetFeature(h.projectID, "auth")
+	if err != nil {
+		t.Fatalf("GetFeature: %v", err)
+	}
+	if reloaded.Branch != "rambl/feat/auth" || reloaded.Status != store.FeatureRunning {
+		t.Errorf("persisted feature = {%q,%q}, want {rambl/feat/auth,%q}", reloaded.Branch, reloaded.Status, store.FeatureRunning)
+	}
+
+	// Real branch and worktree at the contract path.
+	if !worker.BranchExists(h.repo, "rambl/feat/auth") {
+		t.Errorf("branch rambl/feat/auth should exist")
+	}
+	wt := filepath.Join(h.worktreeBase, h.projectID, "@feat-auth")
+	if _, err := os.Stat(wt); err != nil {
+		t.Errorf("feature worktree should exist at %s: %v", wt, err)
+	}
+
+	// Idempotent: a second call is a no-op returning the current feature.
+	again, err := h.r.StartFeature(h.projectID, "auth")
+	if err != nil {
+		t.Fatalf("StartFeature (idempotent): %v", err)
+	}
+	if again.Branch != "rambl/feat/auth" {
+		t.Errorf("idempotent StartFeature branch = %q", again.Branch)
+	}
+
+	// taskBase: standalone task → r.base; feature task → feature branch.
+	standalone := h.addTask("solo", nil)
+	base, err := h.r.taskBase(h.projectID, standalone)
+	if err != nil {
+		t.Fatalf("taskBase standalone: %v", err)
+	}
+	if base != h.r.base {
+		t.Errorf("taskBase standalone = %q, want %q", base, h.r.base)
+	}
+
+	featTask, err := h.st.AddTaskToFeature(h.projectID, f.ID, "login", "Login", "do login", nil)
+	if err != nil {
+		t.Fatalf("AddTaskToFeature: %v", err)
+	}
+	base, err = h.r.taskBase(h.projectID, featTask)
+	if err != nil {
+		t.Fatalf("taskBase feature: %v", err)
+	}
+	if base != "rambl/feat/auth" {
+		t.Errorf("taskBase feature = %q, want rambl/feat/auth", base)
+	}
+
+	// CleanupFeature removes the worktree and branch.
+	if err := h.r.CleanupFeature(h.projectID, "auth"); err != nil {
+		t.Fatalf("CleanupFeature: %v", err)
+	}
+	if worker.BranchExists(h.repo, "rambl/feat/auth") {
+		t.Errorf("branch rambl/feat/auth should be gone after CleanupFeature")
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Errorf("feature worktree should be gone, stat err = %v", err)
+	}
+}
+
+func TestStartFeatureUnknown(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	_, err := h.r.StartFeature(h.projectID, "nope")
+	wantErr(t, err, "no feature")
 }

@@ -59,6 +59,49 @@ func TestCleanupWorktree(t *testing.T) {
 	}
 }
 
+func TestAddFeatureWorktreeAndBranchExists(t *testing.T) {
+	repo := newRepo(t)
+	wtPath := filepath.Join(t.TempDir(), "@feat-x")
+	branch := "rambl/feat/x"
+
+	if BranchExists(repo, branch) {
+		t.Fatalf("branch %q should not exist before AddFeatureWorktree", branch)
+	}
+	if BranchExists(repo, "no-such-branch") {
+		t.Errorf("BranchExists should be false for a bogus name")
+	}
+
+	if err := AddFeatureWorktree(repo, wtPath, branch, "HEAD"); err != nil {
+		t.Fatalf("AddFeatureWorktree: %v", err)
+	}
+
+	// The worktree dir exists and is populated from base (file.txt from newRepo).
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Fatalf("worktree should exist after add: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "file.txt")); err != nil {
+		t.Errorf("worktree should be populated from base (file.txt missing): %v", err)
+	}
+	if !BranchExists(repo, branch) {
+		t.Errorf("BranchExists should be true after AddFeatureWorktree")
+	}
+
+	// Adding the same branch again must error (branch already exists).
+	if err := AddFeatureWorktree(repo, filepath.Join(t.TempDir(), "dup"), branch, "HEAD"); err == nil {
+		t.Errorf("AddFeatureWorktree should error when branch already exists")
+	}
+
+	if err := CleanupWorktree(repo, wtPath, branch); err != nil {
+		t.Fatalf("CleanupWorktree: %v", err)
+	}
+	if _, err := os.Stat(wtPath); !os.IsNotExist(err) {
+		t.Errorf("worktree dir should be gone, stat err = %v", err)
+	}
+	if BranchExists(repo, branch) {
+		t.Errorf("branch %q should be gone after cleanup", branch)
+	}
+}
+
 func TestCleanupWorktreeBestEffort(t *testing.T) {
 	repo := newRepo(t)
 

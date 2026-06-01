@@ -271,6 +271,31 @@ func CleanupWorktree(repoPath, worktreePath, branch string) error {
 	return nil
 }
 
+// AddFeatureWorktree creates featureBranch from base and checks it out in a new
+// worktree at worktreePath: `git worktree add -b <featureBranch> <worktreePath> <base>`.
+// Uses the gitID identity helper. Errors if the branch or worktree already exists.
+func AddFeatureWorktree(repoPath, worktreePath, featureBranch, base string) error {
+	if base == "" {
+		base = "HEAD"
+	}
+	if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
+		return err
+	}
+	gitMu.Lock()
+	defer gitMu.Unlock()
+	out, err := gitID(repoPath, "worktree", "add", "-b", featureBranch, worktreePath, base)
+	if err != nil {
+		return fmt.Errorf("git worktree add: %v: %s", err, out)
+	}
+	return nil
+}
+
+// BranchExists reports whether branch exists in repoPath.
+func BranchExists(repoPath, branch string) bool {
+	_, err := git(repoPath, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	return err == nil
+}
+
 // DiffBranch returns the diffstat and full patch of branch relative to base
 // (three-dot, i.e. since their merge-base), computed in repoPath. Read-only.
 func DiffBranch(repoPath, base, branch string) (stat string, patch string, err error) {
