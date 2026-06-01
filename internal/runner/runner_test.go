@@ -9,10 +9,30 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"rambl/internal/store"
 	"rambl/internal/worker"
 )
+
+func TestSetTurnTimeout(t *testing.T) {
+	r := &Runner{turnTimeout: 15 * time.Minute}
+
+	r.SetTurnTimeout(30 * time.Minute)
+	if r.turnTimeout != 30*time.Minute {
+		t.Fatalf("positive duration: got %v, want %v", r.turnTimeout, 30*time.Minute)
+	}
+
+	r.SetTurnTimeout(0)
+	if r.turnTimeout != 30*time.Minute {
+		t.Fatalf("zero duration should be ignored: got %v, want %v", r.turnTimeout, 30*time.Minute)
+	}
+
+	r.SetTurnTimeout(-5 * time.Minute)
+	if r.turnTimeout != 30*time.Minute {
+		t.Fatalf("negative duration should be ignored: got %v, want %v", r.turnTimeout, 30*time.Minute)
+	}
+}
 
 // --- test helpers ----------------------------------------------------------
 
