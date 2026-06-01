@@ -161,7 +161,7 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		if err := rn.Dispatch(projectID, slug); err != nil {
+		if err := rn.DispatchManual(projectID, slug); err != nil {
 			return mcp.NewToolResultErrorf("dispatch: %v", err), nil
 		}
 		logEvent(st, projectID, "dispatch", slug, fmt.Sprintf("dispatched %s", slug))
