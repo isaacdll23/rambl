@@ -44,6 +44,17 @@ func TestSystemPrompt(t *testing.T) {
 	}
 }
 
+func TestPMSystemPromptMentionsFeatures(t *testing.T) {
+	for _, sub := range []string{"create_feature", "dispatch_feature", "feature_status"} {
+		if !strings.Contains(pmSystemPrompt, sub) {
+			t.Errorf("pmSystemPrompt missing %q", sub)
+		}
+	}
+	if !strings.Contains(strings.ToLower(pmSystemPrompt), "feature") {
+		t.Errorf("pmSystemPrompt should mention %q (case-insensitive)", "feature")
+	}
+}
+
 func TestSettled(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -140,6 +151,9 @@ func TestAllowedTools(t *testing.T) {
 		"mcp__rambl__verify_task",
 		"mcp__rambl__revise_task",
 		"mcp__rambl__open_pr",
+		"mcp__rambl__create_feature",
+		"mcp__rambl__dispatch_feature",
+		"mcp__rambl__feature_status",
 		"Read", "Glob", "Grep",
 	}
 	for _, name := range wantPresent {
