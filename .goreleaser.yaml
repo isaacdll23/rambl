@@ -22,7 +22,6 @@ archives:
     formats: [tar.gz]
     files:
       - README.md
-      - ARCHITECTURE.md
       - docs/*
       - LICENSE*
 
