@@ -90,8 +90,8 @@ configured MCP servers, since it's an ordinary Claude Code session.
 
 ## Releasing
 
-Releases are cut by [Woodpecker CI](.woodpecker.yml): every push and pull request
-runs `go vet` / `go test` / `go build`, and pushing a `v*` tag triggers
+Releases are cut by [Woodpecker CI](.woodpecker.yml): every push runs
+`go vet` / `go test -race` / `go build`, and pushing a `v*` tag triggers
 [GoReleaser](.goreleaser.yaml), which cross-compiles the linux/darwin ×
 amd64/arm64 binaries, archives them with checksums, and publishes a GitHub
 release. The version, commit, and build date are stamped into the binary via
