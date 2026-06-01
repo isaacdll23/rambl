@@ -2,6 +2,9 @@
 /rambl
 /defined
 
+# release artifacts (goreleaser)
+/dist/
+
 # local state (lives in ~/.rambl by default; never commit a DB)
 *.db
 *.db-wal
