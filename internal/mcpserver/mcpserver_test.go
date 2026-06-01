@@ -3,7 +3,10 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -165,6 +168,93 @@ func waitForStatusIf(ctx context.Context, st *store.Store, projectID, slug strin
 	}
 }
 
+// TestPMReviewToolsOverHTTP exercises the PM review/lifecycle tools (delete_task,
+// read_diff, verify_task, revise_task) over the real HTTP transport, backed by a
+// Runner wired to a genuine temp git repo. It only touches validation/error paths
+// and the no-worker delete happy path — none of these spawn a claude worker.
+func TestPMReviewToolsOverHTTP(t *testing.T) {
+	// Real temp git repo with identity + one commit, as the runner's repoPath.
+	repo := t.TempDir()
+	runGit(t, repo, "init")
+	runGit(t, repo, "config", "user.email", "rambl@test")
+	runGit(t, repo, "config", "user.name", "rambl")
+	if err := writeFile(t, filepath.Join(repo, "README.md"), "init\n"); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "init")
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	proj, err := st.EnsureProject(repo, "test")
+	if err != nil {
+		t.Fatalf("project: %v", err)
+	}
+	worktreeBase := t.TempDir()
+	// selfExe "" — no worker is ever spawned by these tools/paths.
+	rn := runner.New(st, repo, "HEAD", "", worktreeBase)
+	srv := New(st, rn, proj)
+
+	httpSrv := server.NewTestStreamableHTTPServer(srv.mcp)
+	defer httpSrv.Close()
+
+	ctx := context.Background()
+	cli, err := mcpclient.NewStreamableHttpClient(httpSrv.URL)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	if err := cli.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if _, err := cli.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: "test", Version: "1.0.0"},
+		},
+	}); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+
+	// delete_task on an unknown slug -> error result.
+	if res := errCall(t, cli, ctx, "delete_task", map[string]any{"slug": "ghost"}); !strings.Contains(textOf(t, res), "no task") {
+		t.Fatalf("delete_task ghost: want 'no task' error, got %q", textOf(t, res))
+	}
+
+	// delete_task happy path: a Todo task with no branch deletes cleanly and
+	// disappears from list_tasks.
+	mustCall(t, cli, ctx, "create_task", map[string]any{
+		"slug": "doomed", "title": "Doomed", "prompt": "build doomed",
+	})
+	mustCall(t, cli, ctx, "delete_task", map[string]any{"slug": "doomed"})
+	res := mustCall(t, cli, ctx, "list_tasks", nil)
+	if strings.Contains(textOf(t, res), "doomed") {
+		t.Fatalf("delete_task: 'doomed' still present in list_tasks: %s", textOf(t, res))
+	}
+
+	// read_diff on a task with no branch -> error result.
+	mustCall(t, cli, ctx, "create_task", map[string]any{
+		"slug": "nobranch", "title": "No branch", "prompt": "x",
+	})
+	if res := errCall(t, cli, ctx, "read_diff", map[string]any{"slug": "nobranch"}); !strings.Contains(textOf(t, res), "no branch") {
+		t.Fatalf("read_diff nobranch: want 'no branch' error, got %q", textOf(t, res))
+	}
+
+	// verify_task on a task with no worktree -> error result.
+	mustCall(t, cli, ctx, "create_task", map[string]any{
+		"slug": "noworktree", "title": "No worktree", "prompt": "x",
+	})
+	if res := errCall(t, cli, ctx, "verify_task", map[string]any{"slug": "noworktree", "command": "true"}); !strings.Contains(textOf(t, res), "no worktree") {
+		t.Fatalf("verify_task noworktree: want 'no worktree' error, got %q", textOf(t, res))
+	}
+
+	// revise_task on an unknown slug -> error result.
+	if res := errCall(t, cli, ctx, "revise_task", map[string]any{"slug": "ghost", "message": "fix it"}); !strings.Contains(textOf(t, res), "no task") {
+		t.Fatalf("revise_task ghost: want 'no task' error, got %q", textOf(t, res))
+	}
+}
+
 func mustCall(t *testing.T, cli *mcpclient.Client, ctx context.Context, name string, args map[string]any) *mcp.CallToolResult {
 	t.Helper()
 	req := mcp.CallToolRequest{}
@@ -192,4 +282,40 @@ func textOf(t *testing.T, res *mcp.CallToolResult) string {
 		t.Fatalf("first content is not text: %T", res.Content[0])
 	}
 	return tc.Text
+}
+
+// errCall calls a tool and asserts the result is an error result (IsError),
+// returning it so the caller can inspect the message.
+func errCall(t *testing.T, cli *mcpclient.Client, ctx context.Context, name string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	req := mcp.CallToolRequest{}
+	req.Params.Name = name
+	if args != nil {
+		req.Params.Arguments = args
+	}
+	res, err := cli.CallTool(ctx, req)
+	if err != nil {
+		t.Fatalf("call %s: %v", name, err)
+	}
+	if !res.IsError {
+		t.Fatalf("call %s: expected error result, got %s", name, textOf(t, res))
+	}
+	return res
+}
+
+// runGit runs a git subcommand in dir and fails the test on error.
+func runGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s (in %s): %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+	return string(out)
+}
+
+func writeFile(t *testing.T, path, content string) error {
+	t.Helper()
+	return os.WriteFile(path, []byte(content), 0o644)
 }
