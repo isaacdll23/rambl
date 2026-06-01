@@ -59,6 +59,49 @@ func TestCleanupWorktree(t *testing.T) {
 	}
 }
 
+func TestAddFeatureWorktreeAndBranchExists(t *testing.T) {
+	repo := newRepo(t)
+	wtPath := filepath.Join(t.TempDir(), "@feat-x")
+	branch := "rambl/feat/x"
+
+	if BranchExists(repo, branch) {
+		t.Fatalf("branch %q should not exist before AddFeatureWorktree", branch)
+	}
+	if BranchExists(repo, "no-such-branch") {
+		t.Errorf("BranchExists should be false for a bogus name")
+	}
+
+	if err := AddFeatureWorktree(repo, wtPath, branch, "HEAD"); err != nil {
+		t.Fatalf("AddFeatureWorktree: %v", err)
+	}
+
+	// The worktree dir exists and is populated from base (file.txt from newRepo).
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Fatalf("worktree should exist after add: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "file.txt")); err != nil {
+		t.Errorf("worktree should be populated from base (file.txt missing): %v", err)
+	}
+	if !BranchExists(repo, branch) {
+		t.Errorf("BranchExists should be true after AddFeatureWorktree")
+	}
+
+	// Adding the same branch again must error (branch already exists).
+	if err := AddFeatureWorktree(repo, filepath.Join(t.TempDir(), "dup"), branch, "HEAD"); err == nil {
+		t.Errorf("AddFeatureWorktree should error when branch already exists")
+	}
+
+	if err := CleanupWorktree(repo, wtPath, branch); err != nil {
+		t.Fatalf("CleanupWorktree: %v", err)
+	}
+	if _, err := os.Stat(wtPath); !os.IsNotExist(err) {
+		t.Errorf("worktree dir should be gone, stat err = %v", err)
+	}
+	if BranchExists(repo, branch) {
+		t.Errorf("branch %q should be gone after cleanup", branch)
+	}
+}
+
 func TestCleanupWorktreeBestEffort(t *testing.T) {
 	repo := newRepo(t)
 
@@ -282,5 +325,112 @@ func TestDiffBranch(t *testing.T) {
 	}
 	if !strings.Contains(patch, "file.txt") {
 		t.Errorf("patch does not mention file.txt: %q", patch)
+	}
+}
+
+// commitBranch creates branch off HEAD in repo, writes content to file, and
+// commits — using a throwaway worktree so the main worktree is untouched.
+func commitBranch(t *testing.T, repo, branch, file, content string) {
+	t.Helper()
+	wt := filepath.Join(t.TempDir(), "wt-"+strings.ReplaceAll(branch, "/", "-"))
+	if out, err := gitID(repo, "worktree", "add", "-b", branch, wt, "HEAD"); err != nil {
+		t.Fatalf("worktree add %s: %v: %s", branch, err, out)
+	}
+	if err := os.WriteFile(filepath.Join(wt, file), []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", file, err)
+	}
+	if out, err := gitID(wt, "add", "-A"); err != nil {
+		t.Fatalf("add: %v: %s", err, out)
+	}
+	if out, err := gitID(wt, "commit", "-m", "change "+file); err != nil {
+		t.Fatalf("commit: %v: %s", err, out)
+	}
+	if out, err := gitID(repo, "worktree", "remove", "--force", wt); err != nil {
+		t.Fatalf("worktree remove: %v: %s", err, out)
+	}
+}
+
+func TestSquashMergeHappyPath(t *testing.T) {
+	repo := newRepo(t)
+	feat := filepath.Join(t.TempDir(), "@feat-x")
+	if err := AddFeatureWorktree(repo, feat, "rambl/feat/x", "HEAD"); err != nil {
+		t.Fatalf("AddFeatureWorktree: %v", err)
+	}
+	commitBranch(t, repo, "rambl/a", "a.txt", "a\n")
+
+	conflict, err := SquashMerge(feat, "rambl/a", "feat(a): add a")
+	if err != nil || conflict {
+		t.Fatalf("SquashMerge a = (%v, %v), want (false, nil)", conflict, err)
+	}
+	if _, err := os.Stat(filepath.Join(feat, "a.txt")); err != nil {
+		t.Errorf("a.txt should exist on feature worktree: %v", err)
+	}
+	out, err := gitID(feat, "log", "-1", "--format=%s")
+	if err != nil {
+		t.Fatalf("log: %v: %s", err, out)
+	}
+	if strings.TrimSpace(out) != "feat(a): add a" {
+		t.Errorf("commit subject = %q, want %q", strings.TrimSpace(out), "feat(a): add a")
+	}
+}
+
+func TestSquashMergeConflictLeavesClean(t *testing.T) {
+	repo := newRepo(t)
+	feat := filepath.Join(t.TempDir(), "@feat-x")
+	if err := AddFeatureWorktree(repo, feat, "rambl/feat/x", "HEAD"); err != nil {
+		t.Fatalf("AddFeatureWorktree: %v", err)
+	}
+	// Both branches edit the same line of file.txt (from newRepo).
+	commitBranch(t, repo, "rambl/a", "file.txt", "from-a\n")
+	commitBranch(t, repo, "rambl/b", "file.txt", "from-b\n")
+
+	if conflict, err := SquashMerge(feat, "rambl/a", "feat(a): edit"); err != nil || conflict {
+		t.Fatalf("SquashMerge a = (%v, %v), want (false, nil)", conflict, err)
+	}
+	conflict, err := SquashMerge(feat, "rambl/b", "feat(b): edit")
+	if !conflict {
+		t.Fatalf("SquashMerge b should conflict, got (%v, %v)", conflict, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "file.txt") {
+		t.Errorf("conflict error should name file.txt, got %v", err)
+	}
+	// Worktree must be left clean with no merge in progress.
+	st, gerr := gitID(feat, "status", "--porcelain")
+	if gerr != nil {
+		t.Fatalf("status: %v: %s", gerr, st)
+	}
+	if strings.TrimSpace(st) != "" {
+		t.Errorf("feature worktree should be clean, got %q", st)
+	}
+	if files, _ := ConflictedFiles(feat); len(files) != 0 {
+		t.Errorf("no unmerged paths expected after abort, got %v", files)
+	}
+}
+
+func TestSquashMergeEmptyNoCommit(t *testing.T) {
+	repo := newRepo(t)
+	feat := filepath.Join(t.TempDir(), "@feat-x")
+	if err := AddFeatureWorktree(repo, feat, "rambl/feat/x", "HEAD"); err != nil {
+		t.Fatalf("AddFeatureWorktree: %v", err)
+	}
+	before, err := gitID(feat, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v: %s", err, before)
+	}
+	// A branch identical to base (no changes).
+	if out, err := gitID(repo, "branch", "rambl/empty", "HEAD"); err != nil {
+		t.Fatalf("branch: %v: %s", err, out)
+	}
+
+	conflict, err := SquashMerge(feat, "rambl/empty", "feat(empty): nothing")
+	if err != nil || conflict {
+		t.Fatalf("SquashMerge empty = (%v, %v), want (false, nil)", conflict, err)
+	}
+	after, err := gitID(feat, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v: %s", err, after)
+	}
+	if strings.TrimSpace(before) != strings.TrimSpace(after) {
+		t.Errorf("HEAD moved on empty squash: %q -> %q", before, after)
 	}
 }

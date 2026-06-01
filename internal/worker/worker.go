@@ -271,6 +271,88 @@ func CleanupWorktree(repoPath, worktreePath, branch string) error {
 	return nil
 }
 
+// AddFeatureWorktree creates featureBranch from base and checks it out in a new
+// worktree at worktreePath: `git worktree add -b <featureBranch> <worktreePath> <base>`.
+// Uses the gitID identity helper. Errors if the branch or worktree already exists.
+func AddFeatureWorktree(repoPath, worktreePath, featureBranch, base string) error {
+	if base == "" {
+		base = "HEAD"
+	}
+	if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
+		return err
+	}
+	gitMu.Lock()
+	defer gitMu.Unlock()
+	out, err := gitID(repoPath, "worktree", "add", "-b", featureBranch, worktreePath, base)
+	if err != nil {
+		return fmt.Errorf("git worktree add: %v: %s", err, out)
+	}
+	return nil
+}
+
+// SquashMerge squashes taskBranch into the branch checked out in featureWorktree,
+// producing exactly one commit with the given message. It runs, in featureWorktree:
+//
+//	git merge --squash <taskBranch>
+//
+// then commits via the gitID identity helper. Behavior:
+//   - On conflict: abort cleanly (git merge --abort / reset --hard so the worktree
+//     is left clean with no merge in progress) and return (true, err) naming the
+//     conflicted files.
+//   - When the squash stages no changes (task added nothing): return (false, nil)
+//     WITHOUT creating an empty commit.
+//   - Otherwise commit and return (false, nil).
+func SquashMerge(featureWorktree, taskBranch, message string) (conflict bool, err error) {
+	gitMu.Lock()
+	defer gitMu.Unlock()
+
+	if out, mergeErr := gitID(featureWorktree, "merge", "--squash", taskBranch); mergeErr != nil {
+		// Capture conflicted paths before cleaning the worktree.
+		files, _ := ConflictedFiles(featureWorktree)
+		// `git merge --squash` records no MERGE_HEAD, so `git merge --abort` is a
+		// best-effort no-op; `git reset --hard` reliably clears the staged squash
+		// and any conflict markers, leaving the worktree clean.
+		_, _ = gitID(featureWorktree, "merge", "--abort")
+		_, _ = gitID(featureWorktree, "reset", "--hard", "HEAD")
+		if len(files) > 0 {
+			return true, fmt.Errorf("squash merge of %s conflicted in: %s", taskBranch, strings.Join(files, ", "))
+		}
+		return false, fmt.Errorf("git merge --squash %s: %v: %s", taskBranch, mergeErr, out)
+	}
+
+	// A squash that staged nothing (the task added no changes vs the feature tip)
+	// must not produce an empty commit.
+	if _, err := gitID(featureWorktree, "diff", "--cached", "--quiet"); err == nil {
+		return false, nil
+	}
+
+	if out, err := gitID(featureWorktree, "commit", "-m", message); err != nil {
+		return false, fmt.Errorf("commit: %v: %s", err, out)
+	}
+	return false, nil
+}
+
+// ConflictedFiles returns unmerged paths in worktree (git diff --name-only --diff-filter=U).
+func ConflictedFiles(worktree string) ([]string, error) {
+	out, err := git(worktree, "diff", "--name-only", "--diff-filter=U")
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, line := range strings.Split(out, "\n") {
+		if p := strings.TrimSpace(line); p != "" {
+			files = append(files, p)
+		}
+	}
+	return files, nil
+}
+
+// BranchExists reports whether branch exists in repoPath.
+func BranchExists(repoPath, branch string) bool {
+	_, err := git(repoPath, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	return err == nil
+}
+
 // DiffBranch returns the diffstat and full patch of branch relative to base
 // (three-dot, i.e. since their merge-base), computed in repoPath. Read-only.
 func DiffBranch(repoPath, base, branch string) (stat string, patch string, err error) {

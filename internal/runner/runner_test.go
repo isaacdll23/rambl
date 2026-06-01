@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	"rambl/internal/store"
+	"rambl/internal/worker"
 )
 
 // --- test helpers ----------------------------------------------------------
@@ -498,4 +500,286 @@ func TestOpenPRGhStep(t *testing.T) {
 
 	_, err := h.r.OpenPR(h.projectID, "prgh", "title", "body")
 	wantErr(t, err, "gh pr create failed")
+}
+
+// --- feature lifecycle ------------------------------------------------------
+
+func TestStartFeatureAndTaskBase(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+
+	f, err := h.st.AddFeature(h.projectID, "auth", "Auth feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+
+	got, err := h.r.StartFeature(h.projectID, "auth")
+	if err != nil {
+		t.Fatalf("StartFeature: %v", err)
+	}
+	if got.Branch != "rambl/feat/auth" {
+		t.Errorf("feature branch = %q, want rambl/feat/auth", got.Branch)
+	}
+	if got.Status != store.FeatureRunning {
+		t.Errorf("feature status = %q, want %q", got.Status, store.FeatureRunning)
+	}
+
+	// Persisted to the store.
+	reloaded, err := h.st.GetFeature(h.projectID, "auth")
+	if err != nil {
+		t.Fatalf("GetFeature: %v", err)
+	}
+	if reloaded.Branch != "rambl/feat/auth" || reloaded.Status != store.FeatureRunning {
+		t.Errorf("persisted feature = {%q,%q}, want {rambl/feat/auth,%q}", reloaded.Branch, reloaded.Status, store.FeatureRunning)
+	}
+
+	// Real branch and worktree at the contract path.
+	if !worker.BranchExists(h.repo, "rambl/feat/auth") {
+		t.Errorf("branch rambl/feat/auth should exist")
+	}
+	wt := filepath.Join(h.worktreeBase, h.projectID, "@feat-auth")
+	if _, err := os.Stat(wt); err != nil {
+		t.Errorf("feature worktree should exist at %s: %v", wt, err)
+	}
+
+	// Idempotent: a second call is a no-op returning the current feature.
+	again, err := h.r.StartFeature(h.projectID, "auth")
+	if err != nil {
+		t.Fatalf("StartFeature (idempotent): %v", err)
+	}
+	if again.Branch != "rambl/feat/auth" {
+		t.Errorf("idempotent StartFeature branch = %q", again.Branch)
+	}
+
+	// taskBase: standalone task → r.base; feature task → feature branch.
+	standalone := h.addTask("solo", nil)
+	base, err := h.r.taskBase(h.projectID, standalone)
+	if err != nil {
+		t.Fatalf("taskBase standalone: %v", err)
+	}
+	if base != h.r.base {
+		t.Errorf("taskBase standalone = %q, want %q", base, h.r.base)
+	}
+
+	featTask, err := h.st.AddTaskToFeature(h.projectID, f.ID, "login", "Login", "do login", nil)
+	if err != nil {
+		t.Fatalf("AddTaskToFeature: %v", err)
+	}
+	base, err = h.r.taskBase(h.projectID, featTask)
+	if err != nil {
+		t.Fatalf("taskBase feature: %v", err)
+	}
+	if base != "rambl/feat/auth" {
+		t.Errorf("taskBase feature = %q, want rambl/feat/auth", base)
+	}
+
+	// CleanupFeature removes the worktree and branch.
+	if err := h.r.CleanupFeature(h.projectID, "auth"); err != nil {
+		t.Fatalf("CleanupFeature: %v", err)
+	}
+	if worker.BranchExists(h.repo, "rambl/feat/auth") {
+		t.Errorf("branch rambl/feat/auth should be gone after CleanupFeature")
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Errorf("feature worktree should be gone, stat err = %v", err)
+	}
+}
+
+func TestStartFeatureUnknown(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	_, err := h.r.StartFeature(h.projectID, "nope")
+	wantErr(t, err, "no feature")
+}
+
+// --- squash merge + topo order ---------------------------------------------
+
+// commitTaskBranch creates rambl/<slug> off base in the repo and commits a file
+// change, via a throwaway worktree so the main checkout is untouched.
+func (h *harness) commitTaskBranch(slug, file, content string) {
+	h.t.Helper()
+	wt := filepath.Join(h.t.TempDir(), "tb-"+slug)
+	runGit(h.t, h.repo, "worktree", "add", "-b", "rambl/"+slug, wt, "HEAD")
+	if err := os.WriteFile(filepath.Join(wt, file), []byte(content), 0o644); err != nil {
+		h.t.Fatalf("write %s: %v", file, err)
+	}
+	runGit(h.t, wt, "add", "-A")
+	runGit(h.t, wt, "commit", "-m", "change "+file)
+	runGit(h.t, h.repo, "worktree", "remove", "--force", wt)
+}
+
+func TestMergeTaskIntoFeatureOrdering(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+
+	f, err := h.st.AddFeature(h.projectID, "auth", "Auth feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	if _, err := h.r.StartFeature(h.projectID, "auth"); err != nil {
+		t.Fatalf("StartFeature: %v", err)
+	}
+
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "a", "Task A", "do a", nil); err != nil {
+		t.Fatalf("AddTaskToFeature a: %v", err)
+	}
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "b", "Task B", "do b", nil); err != nil {
+		t.Fatalf("AddTaskToFeature b: %v", err)
+	}
+	// Disjoint file changes on each task branch.
+	h.commitTaskBranch("a", "a.txt", "a\n")
+	h.commitTaskBranch("b", "b.txt", "b\n")
+
+	if err := h.r.MergeTaskIntoFeature(h.projectID, "auth", "a"); err != nil {
+		t.Fatalf("MergeTaskIntoFeature a: %v", err)
+	}
+	if err := h.r.MergeTaskIntoFeature(h.projectID, "auth", "b"); err != nil {
+		t.Fatalf("MergeTaskIntoFeature b: %v", err)
+	}
+
+	wt := filepath.Join(h.worktreeBase, h.projectID, "@feat-auth")
+	// Both files present on the feature branch.
+	for _, fn := range []string{"a.txt", "b.txt"} {
+		if _, err := os.Stat(filepath.Join(wt, fn)); err != nil {
+			t.Errorf("%s should exist on feature worktree: %v", fn, err)
+		}
+	}
+	// Exactly two commits on top of base, with the expected subjects.
+	out := runGit(t, wt, "log", "--format=%s", "HEAD~2..HEAD")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 commits on top of base, got %d: %q", len(lines), out)
+	}
+	// log is newest-first: b then a.
+	if lines[0] != "feat(b): Task B" || lines[1] != "feat(a): Task A" {
+		t.Errorf("commit subjects = %v, want [feat(b): Task B, feat(a): Task A]", lines)
+	}
+}
+
+func TestMergeTaskIntoFeatureConflict(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+
+	f, err := h.st.AddFeature(h.projectID, "auth", "Auth feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	if _, err := h.r.StartFeature(h.projectID, "auth"); err != nil {
+		t.Fatalf("StartFeature: %v", err)
+	}
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "a", "Task A", "do a", nil); err != nil {
+		t.Fatalf("AddTaskToFeature a: %v", err)
+	}
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "b", "Task B", "do b", nil); err != nil {
+		t.Fatalf("AddTaskToFeature b: %v", err)
+	}
+	// Both edit the same line of README.md (from newHarness's repo).
+	h.commitTaskBranch("a", "README.md", "from-a\n")
+	h.commitTaskBranch("b", "README.md", "from-b\n")
+
+	if err := h.r.MergeTaskIntoFeature(h.projectID, "auth", "a"); err != nil {
+		t.Fatalf("MergeTaskIntoFeature a: %v", err)
+	}
+	err = h.r.MergeTaskIntoFeature(h.projectID, "auth", "b")
+	var mce *MergeConflictError
+	if !errors.As(err, &mce) {
+		t.Fatalf("expected *MergeConflictError, got %v", err)
+	}
+	if mce.Feature != "auth" || mce.Task != "b" {
+		t.Errorf("conflict err fields = {%q,%q}, want {auth,b}", mce.Feature, mce.Task)
+	}
+	found := false
+	for _, fn := range mce.Files {
+		if fn == "README.md" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("conflict files = %v, want to include README.md", mce.Files)
+	}
+	// Feature worktree left clean, no merge in progress.
+	wt := filepath.Join(h.worktreeBase, h.projectID, "@feat-auth")
+	st := runGit(t, wt, "status", "--porcelain")
+	if strings.TrimSpace(st) != "" {
+		t.Errorf("feature worktree should be clean after conflict, got %q", st)
+	}
+}
+
+func slugs(tasks []*store.Task) []string {
+	out := make([]string, len(tasks))
+	for i, t := range tasks {
+		out[i] = t.Slug
+	}
+	return out
+}
+
+func TestTopoOrder(t *testing.T) {
+	tk := func(slug string, deps ...string) *store.Task {
+		return &store.Task{Slug: slug, Deps: deps}
+	}
+	eq := func(got, want []string) bool {
+		if len(got) != len(want) {
+			return false
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Linear chain a -> b -> c (a depends on b depends on c).
+	chain := []*store.Task{tk("a", "b"), tk("b", "c"), tk("c")}
+	got, err := TopoOrder(chain)
+	if err != nil {
+		t.Fatalf("chain: %v", err)
+	}
+	if want := []string{"c", "b", "a"}; !eq(slugs(got), want) {
+		t.Errorf("chain order = %v, want %v", slugs(got), want)
+	}
+
+	// Diamond: d depends on b and c; b and c depend on a. Ties break by slug.
+	diamond := []*store.Task{tk("d", "b", "c"), tk("b", "a"), tk("c", "a"), tk("a")}
+	got, err = TopoOrder(diamond)
+	if err != nil {
+		t.Fatalf("diamond: %v", err)
+	}
+	if want := []string{"a", "b", "c", "d"}; !eq(slugs(got), want) {
+		t.Errorf("diamond order = %v, want %v", slugs(got), want)
+	}
+
+	// All independent → ascending slug order.
+	indep := []*store.Task{tk("c"), tk("a"), tk("b")}
+	got, err = TopoOrder(indep)
+	if err != nil {
+		t.Fatalf("indep: %v", err)
+	}
+	if want := []string{"a", "b", "c"}; !eq(slugs(got), want) {
+		t.Errorf("indep order = %v, want %v", slugs(got), want)
+	}
+
+	// Deps referencing slugs outside the set are ignored.
+	external := []*store.Task{tk("a", "external"), tk("b", "a")}
+	got, err = TopoOrder(external)
+	if err != nil {
+		t.Fatalf("external: %v", err)
+	}
+	if want := []string{"a", "b"}; !eq(slugs(got), want) {
+		t.Errorf("external order = %v, want %v", slugs(got), want)
+	}
+
+	// Cycle a <-> b → error.
+	cycle := []*store.Task{tk("a", "b"), tk("b", "a")}
+	if _, err := TopoOrder(cycle); err == nil {
+		t.Errorf("expected error for cycle, got nil")
+	}
 }
