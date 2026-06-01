@@ -104,6 +104,90 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 		return mcp.NewToolResultText(fmt.Sprintf("sent to %q; poll worker_status", slug)), nil
 	})
 
+	s.AddTool(mcp.NewTool("delete_task",
+		mcp.WithDescription("Permanently delete a task and reclaim its git worktree and branch. Use to prune stale, duplicate, or superseded tasks, or to tidy a task whose work is already merged. Refuses a task that is currently running. This cannot be undone."),
+		mcp.WithString("slug", mcp.Required(), mcp.Description("task slug to delete")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		slug, err := req.RequireString("slug")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if err := rn.Delete(projectID, slug); err != nil {
+			return mcp.NewToolResultErrorf("delete_task: %v", err), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("deleted task %q (worktree and branch reclaimed)", slug)), nil
+	})
+
+	s.AddTool(mcp.NewTool("read_diff",
+		mcp.WithDescription("Show the diff of a task's rambl/<slug> branch (stat plus patch) so you can review what the worker actually changed before validating or shipping it."),
+		mcp.WithString("slug", mcp.Required(), mcp.Description("task slug to diff")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		slug, err := req.RequireString("slug")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		out, err := rn.Diff(projectID, slug)
+		if err != nil {
+			return mcp.NewToolResultErrorf("read_diff: %v", err), nil
+		}
+		return mcp.NewToolResultText(out), nil
+	})
+
+	s.AddTool(mcp.NewTool("verify_task",
+		mcp.WithDescription("Run a build/test command inside the task's worktree and return its PASS/FAIL output, to validate a worker's work. Pass an explicit command (e.g. 'go build ./... && go test ./...'); if omitted, a Go project is auto-detected."),
+		mcp.WithString("slug", mcp.Required(), mcp.Description("task slug to verify")),
+		mcp.WithString("command", mcp.Description("optional build/test command; if omitted, a Go project is auto-detected")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		slug, err := req.RequireString("slug")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		command := req.GetString("command", "")
+		out, err := rn.Verify(projectID, slug, command)
+		if err != nil {
+			return mcp.NewToolResultErrorf("verify_task: %v", err), nil
+		}
+		return mcp.NewToolResultText(out), nil
+	})
+
+	s.AddTool(mcp.NewTool("revise_task",
+		mcp.WithDescription("Hand a finished task's branch back to a worker with feedback so it iterates on its own prior output (reuses the live session if present, else reopens the branch). Use after read_diff/verify_task surface issues. Poll worker_status afterward."),
+		mcp.WithString("slug", mcp.Required(), mcp.Description("task slug to revise")),
+		mcp.WithString("message", mcp.Required(), mcp.Description("feedback for the worker to iterate on")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		slug, err := req.RequireString("slug")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		message, err := req.RequireString("message")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if err := rn.Revise(projectID, slug, message); err != nil {
+			return mcp.NewToolResultErrorf("revise_task: %v", err), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("revising %q; poll worker_status", slug)), nil
+	})
+
+	s.AddTool(mcp.NewTool("open_pr",
+		mcp.WithDescription("Push the task's rambl/<slug> branch to origin and open a GitHub pull request for the human to review. Only call after you have reviewed the diff (read_diff), validated the work (verify_task), and completed any needed revisions. Requires gh and an origin GitHub remote. Returns the PR URL."),
+		mcp.WithString("slug", mcp.Required(), mcp.Description("task slug to open a PR for")),
+		mcp.WithString("title", mcp.Description("PR title; defaults to the task title")),
+		mcp.WithString("body", mcp.Description("PR body, markdown")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		slug, err := req.RequireString("slug")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		title := req.GetString("title", "")
+		body := req.GetString("body", "")
+		url, err := rn.OpenPR(projectID, slug, title, body)
+		if err != nil {
+			return mcp.NewToolResultErrorf("open_pr: %v", err), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("opened PR for %q: %s", slug, url)), nil
+	})
+
 	return &Server{mcp: s}
 }
 

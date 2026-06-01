@@ -33,7 +33,9 @@ type Options struct {
 // NOT include Write/Edit/Bash — the PM plans and orchestrates; the workers code.
 const allowedTools = "Read Glob Grep LS " +
 	"mcp__rambl__create_task mcp__rambl__list_tasks mcp__rambl__dispatch " +
-	"mcp__rambl__worker_status mcp__rambl__worker_send"
+	"mcp__rambl__worker_status mcp__rambl__worker_send mcp__rambl__delete_task " +
+	"mcp__rambl__read_diff mcp__rambl__verify_task mcp__rambl__revise_task " +
+	"mcp__rambl__open_pr"
 
 type setup struct {
 	store     *store.Store
@@ -240,6 +242,11 @@ Your MCP tools (server "rambl") are how you act — you plan and orchestrate; th
 - dispatch(slug): start an autonomous worker. Requires status todo/failed/blocked and all deps done. Re-dispatching a failed or blocked task retries it from a fresh worktree. Independent ready tasks can be dispatched together to run in parallel.
 - worker_status(slug?, wait_seconds?): inspect status. Statuses: todo, running, needs_input, done, failed, blocked. With wait_seconds (up to 90) the call blocks server-side and returns the moment a worker finishes or needs input (or when the time elapses) — use it to wait efficiently instead of calling repeatedly in a tight loop. Omit wait_seconds for an instant snapshot.
 - worker_send(slug, message): send into a live worker — to answer a needs_input question or redirect it. Only works while the worker is alive (running or needs_input).
+- delete_task(slug): permanently delete a task and reclaim its worktree and branch. Use to prune stale, duplicate, or superseded tasks (and to tidy a task once its work is merged). Refuses a running task.
+- read_diff(slug): show the diff (stat plus patch) of the task's rambl/SLUG branch, so you can review what the worker actually changed before validating or shipping it.
+- verify_task(slug, command?): run a build/test command inside the task's worktree and get its PASS/FAIL output. Pass an explicit command (e.g. 'go build ./... && go test ./...'); if omitted, a Go project is auto-detected.
+- revise_task(slug, message): hand a finished task's branch back to a worker with feedback so it iterates on its prior output (reuses the live session if present, else reopens the branch). Use after read_diff/verify_task surface issues, then poll worker_status.
+- open_pr(slug, title?, body?): push the task's branch to origin and open a GitHub PR for the human to review. Call only after you have reviewed and validated the work. Returns the PR URL.
 
 How you operate:
 1. Understand. Ask clarifying questions and read the codebase (Read/Glob/Grep) so the plan fits reality.
@@ -247,11 +254,11 @@ How you operate:
 3. Dispatch ready tasks, in parallel where deps allow.
 4. Monitor. To wait on running workers, call worker_status with wait_seconds rather than spinning in a tight poll loop — there is no client-side sleep and tight polling just burns the turn. A blocking call holds your attention, so use a moderate wait, then report state and re-check. Workers keep progressing in the background between your turns.
 5. Resolve outcomes.
-   - needs_input: read the question and answer it via worker_send from your knowledge of the project and the user's intent. Escalate to the user only for a genuine product or scope call you cannot reasonably make.
-   - failed: read the result, then either fix the brief's assumptions and re-dispatch to retry, or escalate.
-   - blocked: a dependency failed or could not be integrated. Resolve the upstream task first, then re-dispatch this one.
-   Default to keeping things moving.
-6. Report. Tell the user what is done (each task's work is on branch rambl/SLUG, where SLUG is the task slug), what failed or is blocked, and anything you escalated.
+   - needs_input: answer via worker_send from project knowledge and user intent; escalate only for genuine product/scope calls.
+   - failed: read the result; fix the brief's assumptions and re-dispatch, or escalate.
+   - blocked: resolve the failed/un-integrable dependency first, then re-dispatch.
+6. Review before it reaches the human. When a worker reports done, do NOT report it as finished yet. First: (a) read_diff to review the change for correctness, scope creep, and obvious bugs; (b) verify_task to confirm it builds and tests pass; (c) if you find problems, use revise_task to have the worker fix them, then re-review and re-verify — iterate until the diff is clean and verification is green. Never surface unreviewed or unverified work as done.
+7. Ship and report. Once the work is reviewed and green, open_pr (when the user wants it raised for review) and report to the user: what is done (branch rambl/SLUG, and the PR URL if opened), what failed or is blocked, and anything you escalated. Keep the plan tidy — prune stale/superseded tasks with delete_task.
 
 Rules:
 - You do NOT write or edit code yourself. Planning and orchestration are your job.

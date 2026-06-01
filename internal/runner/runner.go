@@ -8,6 +8,8 @@ package runner
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -30,7 +32,9 @@ Signal your outcome with EXACTLY one marker as the final line of your final mess
 - Only if you are genuinely blocked and cannot proceed without a decision you cannot reasonably make yourself: a line
     RAMBL_BLOCKED: <one sentence stating exactly what you need decided>
 
-Do not emit either marker until you are actually done or actually blocked. Emit only one.`
+Do not emit either marker until you are actually done or actually blocked. Emit only one.
+
+Before declaring completion, verify your work: make sure it compiles and that the relevant build and tests pass; only emit RAMBL_DONE once it is green.`
 
 // Runner owns the set of live workers for a project.
 type Runner struct {
@@ -160,6 +164,210 @@ func (r *Runner) Send(projectID, slug, message string) error {
 	return nil
 }
 
+// Delete retires any live worker for the task, removes its worktree and
+// branch, and deletes the task from the store. Refuses a running task.
+func (r *Runner) Delete(projectID, slug string) error {
+	t, err := r.store.GetTask(projectID, slug)
+	if err != nil {
+		return err
+	}
+	if t == nil {
+		return fmt.Errorf("no task %q", slug)
+	}
+	if t.Status == store.Running {
+		return fmt.Errorf("task %q is running; cannot delete a running task", slug)
+	}
+	r.retire(slug)
+	var worktreePath string
+	if r.worktreeBase != "" {
+		worktreePath = filepath.Join(r.worktreeBase, projectID, slug)
+	}
+	_ = worker.CleanupWorktree(r.repoPath, worktreePath, t.Branch)
+	return r.store.DeleteTask(projectID, slug)
+}
+
+// Diff returns a human-readable diff (stat + capped patch) of the task's
+// branch relative to the runner's base ref, for the PM to review.
+func (r *Runner) Diff(projectID, slug string) (string, error) {
+	t, err := r.store.GetTask(projectID, slug)
+	if err != nil {
+		return "", err
+	}
+	if t == nil {
+		return "", fmt.Errorf("no task %q", slug)
+	}
+	if t.Branch == "" {
+		return "", fmt.Errorf("task %q has no branch yet (nothing dispatched)", slug)
+	}
+	stat, patch, err := worker.DiffBranch(r.repoPath, r.base, t.Branch)
+	if err != nil {
+		return "", err
+	}
+	if stat == "" && patch == "" {
+		return fmt.Sprintf("(no changes on %s relative to %s)", t.Branch, r.base), nil
+	}
+	if len(patch) > 60000 {
+		origLen := len(patch)
+		patch = patch[:60000] + fmt.Sprintf("\n... [diff truncated at 60000 of %d bytes]", origLen)
+	}
+	return stat + "\n\n" + patch, nil
+}
+
+// Verify runs a build/test command inside the task's worktree and returns a
+// PASS/FAIL-prefixed combined output, so the PM can validate a worker's work.
+func (r *Runner) Verify(projectID, slug, command string) (string, error) {
+	t, err := r.store.GetTask(projectID, slug)
+	if err != nil {
+		return "", err
+	}
+	if t == nil {
+		return "", fmt.Errorf("no task %q", slug)
+	}
+	if r.worktreeBase == "" {
+		return "", fmt.Errorf("no worktree base configured")
+	}
+	worktreePath := filepath.Join(r.worktreeBase, projectID, slug)
+	if _, err := os.Stat(worktreePath); err != nil {
+		return "", fmt.Errorf("no worktree for %q (dispatch it first)", slug)
+	}
+	if command == "" {
+		if _, err := os.Stat(filepath.Join(worktreePath, "go.mod")); err == nil {
+			command = "go build ./... && go test ./..."
+		} else {
+			return "", fmt.Errorf("no verify command given and could not auto-detect; pass an explicit command")
+		}
+	}
+	cmd := exec.Command("sh", "-c", command)
+	cmd.Dir = worktreePath
+	cmd.Env = os.Environ()
+	out, runErr := cmd.CombinedOutput()
+	output := string(out)
+	if len(output) > 30000 {
+		origLen := len(output)
+		output = output[:30000] + fmt.Sprintf("\n... [output truncated at 30000 of %d bytes]", origLen)
+	}
+	var result string
+	if runErr == nil {
+		result = "VERIFY PASSED\n\n"
+	} else {
+		result = fmt.Sprintf("VERIFY FAILED (%v)\n\n", runErr)
+	}
+	return result + output, nil
+}
+
+// Revise hands a finished task's branch back to a worker with feedback so it
+// can iterate. Reuses a live worker if one exists; otherwise reopens the
+// existing worktree+branch. The resulting turn is committed on success.
+func (r *Runner) Revise(projectID, slug, message string) error {
+	t, err := r.store.GetTask(projectID, slug)
+	if err != nil {
+		return err
+	}
+	if t == nil {
+		return fmt.Errorf("no task %q", slug)
+	}
+	if t.Branch == "" {
+		return fmt.Errorf("task %q has no branch to revise", slug)
+	}
+	if t.Status == store.Running {
+		return fmt.Errorf("task %q is running", slug)
+	}
+
+	r.mu.Lock()
+	w := r.workers[slug]
+	r.mu.Unlock()
+	if w != nil {
+		return r.Send(projectID, slug, message)
+	}
+
+	spec := worker.Spec{
+		ID: slug, Prompt: message, RepoPath: r.repoPath, Base: r.base,
+		SystemPrompt: WorkerSystemPrompt, Reopen: true,
+	}
+	if r.worktreeBase != "" {
+		spec.Worktree = filepath.Join(r.worktreeBase, projectID, slug)
+	}
+	nw := worker.New(spec)
+	nw.TurnTimeout = r.turnTimeout
+
+	t.Status = store.Running
+	t.Question = ""
+	if err := r.store.Update(t); err != nil {
+		return err
+	}
+
+	go func() {
+		if err := nw.Start(context.Background(), r.selfExe); err != nil {
+			r.fail(projectID, slug, "revise start: "+err.Error())
+			return
+		}
+		r.mu.Lock()
+		r.workers[slug] = nw
+		r.mu.Unlock()
+
+		turn, err := nw.Run(context.Background())
+		if err != nil {
+			r.fail(projectID, slug, "revise run: "+err.Error())
+			return
+		}
+		r.apply(projectID, slug, nw, turn)
+	}()
+	return nil
+}
+
+// OpenPR pushes the task's branch to origin and opens a GitHub PR via gh,
+// returning gh's output (the PR URL). Requires gh installed/authed and an
+// origin remote pointing at GitHub.
+func (r *Runner) OpenPR(projectID, slug, title, body string) (string, error) {
+	t, err := r.store.GetTask(projectID, slug)
+	if err != nil {
+		return "", err
+	}
+	if t == nil {
+		return "", fmt.Errorf("no task %q", slug)
+	}
+	if t.Branch == "" {
+		return "", fmt.Errorf("task %q has no branch to open a PR for", slug)
+	}
+	if title == "" {
+		title = t.Title
+	}
+	if body == "" {
+		body = "Automated by rambl."
+	}
+	base := r.defaultBase()
+	if out, err := worker.PushBranch(r.repoPath, "origin", t.Branch); err != nil {
+		return "", fmt.Errorf("git push failed: %v: %s", err, out)
+	}
+	cmd := exec.Command("gh", "pr", "create", "--base", base, "--head", t.Branch, "--title", title, "--body", body)
+	cmd.Dir = r.repoPath
+	cmd.Env = os.Environ()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh pr create failed (is gh installed and authenticated, and origin a GitHub remote?): %v: %s", err, string(out))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// defaultBase resolves the PR base branch from origin's HEAD symbolic ref,
+// falling back to "main".
+func (r *Runner) defaultBase() string {
+	cmd := exec.Command("git", "symbolic-ref", "refs/remotes/origin/HEAD")
+	cmd.Dir = r.repoPath
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "main"
+	}
+	ref := strings.TrimSpace(string(out))
+	if i := strings.LastIndex(ref, "/"); i >= 0 {
+		ref = strings.TrimSpace(ref[i+1:])
+	}
+	if ref == "" {
+		return "main"
+	}
+	return ref
+}
+
 // apply records the outcome of a completed turn and, on completion, commits and
 // retires the worker; on a block it leaves the worker alive for follow-up.
 func (r *Runner) apply(projectID, slug string, w *worker.Worker, turn worker.Turn) {
@@ -196,15 +404,23 @@ func (r *Runner) apply(projectID, slug string, w *worker.Worker, turn worker.Tur
 }
 
 // classify maps a worker's final message to an outcome via the marker protocol.
+// The protocol requires the marker to be the final line of the worker's final
+// message, so classification inspects ONLY the last non-empty line — a marker
+// quoted earlier in the body (e.g. prose describing a test case) is ignored.
 func classify(reply string) (store.Status, string) {
-	if i := strings.LastIndex(reply, "RAMBL_BLOCKED:"); i >= 0 {
-		q := strings.TrimSpace(reply[i+len("RAMBL_BLOCKED:"):])
-		if nl := strings.IndexByte(q, '\n'); nl >= 0 {
-			q = strings.TrimSpace(q[:nl])
+	var last string
+	lines := strings.Split(reply, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+			last = trimmed
+			break
 		}
+	}
+	if strings.HasPrefix(last, "RAMBL_BLOCKED:") {
+		q := strings.TrimSpace(strings.TrimPrefix(last, "RAMBL_BLOCKED:"))
 		return store.NeedsInput, q
 	}
-	if strings.Contains(reply, "RAMBL_DONE") {
+	if last == "RAMBL_DONE" {
 		return store.Done, ""
 	}
 	return store.NeedsInput, "(worker ended its turn without a DONE or BLOCKED marker)"

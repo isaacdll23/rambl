@@ -89,6 +89,137 @@ func TestStoreLifecycle(t *testing.T) {
 	}
 }
 
+func TestDeleteTask(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	proj, err := s.EnsureProject("/repo/calc", "calc")
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+
+	if _, err := s.AddTask(proj, "core", "Core lib", "build core", nil); err != nil {
+		t.Fatalf("add core: %v", err)
+	}
+	if _, err := s.AddTask(proj, "cli", "CLI", "build cli", []string{"core"}); err != nil {
+		t.Fatalf("add cli: %v", err)
+	}
+
+	// Delete the task that has a dependency edge.
+	if err := s.DeleteTask(proj, "cli"); err != nil {
+		t.Fatalf("delete cli: %v", err)
+	}
+
+	// The task is gone.
+	got, err := s.GetTask(proj, "cli")
+	if err != nil {
+		t.Fatalf("get cli after delete: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected nil for deleted task, got %+v", got)
+	}
+
+	// Its dependency edge is gone too — core no longer has cli pointing at it,
+	// and there are no dangling rows. Re-querying core proves the deps table is
+	// clean (core itself has no deps; cli's edge to core was removed).
+	tasks, err := s.ListTasks(proj)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Slug != "core" {
+		t.Fatalf("want only [core] remaining, got %+v", tasks)
+	}
+	if len(tasks[0].Deps) != 0 {
+		t.Fatalf("core deps = %v, want []", tasks[0].Deps)
+	}
+
+	// Deleting a non-existent slug errors.
+	if err := s.DeleteTask(proj, "nope"); err == nil {
+		t.Fatal("expected error deleting non-existent task, got nil")
+	}
+}
+
+// Deleting a task that is a *prerequisite* of another removes the depends_on
+// edge so no dangling reference remains: the dependent task no longer reports
+// the deleted slug among its Deps.
+func TestDeleteTaskPrerequisite(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	proj, err := s.EnsureProject("/repo/calc", "calc")
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+
+	// A is a prerequisite of B.
+	if _, err := s.AddTask(proj, "a", "Task A", "build a", nil); err != nil {
+		t.Fatalf("add a: %v", err)
+	}
+	if _, err := s.AddTask(proj, "b", "Task B", "build b", []string{"a"}); err != nil {
+		t.Fatalf("add b: %v", err)
+	}
+
+	// Delete the prerequisite A.
+	if err := s.DeleteTask(proj, "a"); err != nil {
+		t.Fatalf("delete a: %v", err)
+	}
+
+	// A is gone.
+	if got, err := s.GetTask(proj, "a"); err != nil || got != nil {
+		t.Fatalf("expected a deleted, got %+v (err %v)", got, err)
+	}
+
+	// B survives, but its edge to A is removed — re-fetch proves no dangling dep.
+	b, err := s.GetTask(proj, "b")
+	if err != nil {
+		t.Fatalf("get b: %v", err)
+	}
+	if b == nil {
+		t.Fatal("task b missing after deleting its prerequisite")
+	}
+	if len(b.Deps) != 0 {
+		t.Fatalf("b deps = %v, want [] (edge to deleted a should be gone)", b.Deps)
+	}
+}
+
+// Deleting the same slug twice: the first call succeeds, the second errors
+// because the task no longer exists.
+func TestDeleteTaskTwice(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	proj, err := s.EnsureProject("/repo/calc", "calc")
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+
+	if _, err := s.AddTask(proj, "solo", "Solo", "do solo", nil); err != nil {
+		t.Fatalf("add solo: %v", err)
+	}
+
+	if err := s.DeleteTask(proj, "solo"); err != nil {
+		t.Fatalf("first delete: %v", err)
+	}
+	if err := s.DeleteTask(proj, "solo"); err == nil {
+		t.Fatal("expected error on second delete of the same slug, got nil")
+	}
+}
+
 func TestListProjects(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 

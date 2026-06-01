@@ -32,6 +32,7 @@ type Spec struct {
 	MergeRefs    []string // refs (dependency branches) merged into the worktree before running
 	SystemPrompt string   // appended to the worker's system prompt (autonomy + outcome protocol)
 	Worktree     string   // explicit absolute worktree path; if empty, defaults to <RepoPath>/.rambl/worktrees/<ID>
+	Reopen       bool     // if true, attach to the existing branch+worktree instead of creating them (used to iterate on a task's prior output)
 }
 
 // Turn is the outcome of one prompt→completion cycle.
@@ -75,27 +76,36 @@ func (w *Worker) Start(ctx context.Context, selfExe string) error {
 		w.Worktree = filepath.Join(w.Spec.RepoPath, ".rambl", "worktrees", w.Spec.ID)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(w.Worktree), 0o755); err != nil {
-		return err
-	}
-	gitMu.Lock()
-	out, err := git(w.Spec.RepoPath, "worktree", "add", "-b", w.Branch, w.Worktree, w.Spec.Base)
-	gitMu.Unlock()
-	if err != nil {
-		return fmt.Errorf("git worktree add: %v: %s", err, out)
-	}
+	if w.Spec.Reopen {
+		// Attach to the worker's prior output instead of creating a fresh
+		// worktree+branch — used to iterate on a task that already ran.
+		if _, err := os.Stat(w.Worktree); err != nil {
+			return fmt.Errorf("cannot reopen %q: worktree %s missing: %v", w.Spec.ID, w.Worktree, err)
+		}
+	} else {
+		if err := os.MkdirAll(filepath.Dir(w.Worktree), 0o755); err != nil {
+			return err
+		}
+		gitMu.Lock()
+		out, err := git(w.Spec.RepoPath, "worktree", "add", "-b", w.Branch, w.Worktree, w.Spec.Base)
+		gitMu.Unlock()
+		if err != nil {
+			return fmt.Errorf("git worktree add: %v: %s", err, out)
+		}
 
-	// Integrate dependency outputs by merging their branches into this
-	// worktree, so a downstream task actually sees upstream code. A conflict is
-	// reported so the orchestrator can mark the task blocked.
-	for _, ref := range w.Spec.MergeRefs {
-		if out, err := gitID(w.Worktree, "merge", "--no-edit", "-m", "rambl: merge "+ref, ref); err != nil {
-			_, _ = gitID(w.Worktree, "merge", "--abort")
-			w.rollback()
-			return fmt.Errorf("merge %s into %s failed (conflict?): %v: %s", ref, w.Spec.ID, err, out)
+		// Integrate dependency outputs by merging their branches into this
+		// worktree, so a downstream task actually sees upstream code. A conflict is
+		// reported so the orchestrator can mark the task blocked.
+		for _, ref := range w.Spec.MergeRefs {
+			if out, err := gitID(w.Worktree, "merge", "--no-edit", "-m", "rambl: merge "+ref, ref); err != nil {
+				_, _ = gitID(w.Worktree, "merge", "--abort")
+				w.rollback()
+				return fmt.Errorf("merge %s into %s failed (conflict?): %v: %s", ref, w.Spec.ID, err, out)
+			}
 		}
 	}
 
+	var err error
 	if w.hookln, err = hook.NewListener(); err != nil {
 		return err
 	}
@@ -244,6 +254,40 @@ func (w *Worker) Cleanup() error {
 	}
 	_, err := git(w.Spec.RepoPath, "branch", "-D", w.Branch)
 	return err
+}
+
+// CleanupWorktree removes a worktree directory and deletes its branch
+// (best-effort, force). Safe to call when no live worker exists. Uses the
+// shared gitMu lock to avoid racing concurrent git operations on the repo.
+func CleanupWorktree(repoPath, worktreePath, branch string) error {
+	gitMu.Lock()
+	defer gitMu.Unlock()
+	if worktreePath != "" {
+		_, _ = git(repoPath, "worktree", "remove", "--force", worktreePath)
+	}
+	if branch != "" {
+		_, _ = git(repoPath, "branch", "-D", branch)
+	}
+	return nil
+}
+
+// DiffBranch returns the diffstat and full patch of branch relative to base
+// (three-dot, i.e. since their merge-base), computed in repoPath. Read-only.
+func DiffBranch(repoPath, base, branch string) (stat string, patch string, err error) {
+	stat, err = git(repoPath, "diff", "--stat", base+"..."+branch)
+	if err != nil {
+		return "", "", err
+	}
+	patch, err = git(repoPath, "diff", base+"..."+branch)
+	if err != nil {
+		return "", "", err
+	}
+	return strings.TrimRight(stat, " \t\r\n"), strings.TrimRight(patch, " \t\r\n"), nil
+}
+
+// PushBranch pushes branch to remote, setting upstream. Returns combined output.
+func PushBranch(repoPath, remote, branch string) (string, error) {
+	return git(repoPath, "push", "-u", remote, branch)
 }
 
 func git(dir string, args ...string) (string, error) {
