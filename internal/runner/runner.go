@@ -8,6 +8,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -33,25 +34,27 @@ Do not emit either marker until you are actually done or actually blocked. Emit 
 
 // Runner owns the set of live workers for a project.
 type Runner struct {
-	store       *store.Store
-	repoPath    string
-	base        string
-	selfExe     string
-	turnTimeout time.Duration
+	store        *store.Store
+	repoPath     string
+	base         string
+	selfExe      string
+	worktreeBase string
+	turnTimeout  time.Duration
 
 	mu      sync.Mutex
 	workers map[string]*worker.Worker // keyed by task slug
 }
 
 // New constructs a Runner. selfExe is this binary's path (for workers' Stop hook).
-func New(st *store.Store, repoPath, base, selfExe string) *Runner {
+func New(st *store.Store, repoPath, base, selfExe, worktreeBase string) *Runner {
 	if base == "" {
 		base = "HEAD"
 	}
 	return &Runner{
 		store: st, repoPath: repoPath, base: base, selfExe: selfExe,
-		turnTimeout: 5 * time.Minute,
-		workers:     map[string]*worker.Worker{},
+		worktreeBase: worktreeBase,
+		turnTimeout:  5 * time.Minute,
+		workers:      map[string]*worker.Worker{},
 	}
 }
 
@@ -101,10 +104,14 @@ func (r *Runner) Dispatch(projectID, slug string) error {
 }
 
 func (r *Runner) start(projectID, slug, prompt string, mergeRefs []string) {
-	w := worker.New(worker.Spec{
+	spec := worker.Spec{
 		ID: slug, Prompt: prompt, RepoPath: r.repoPath, Base: r.base,
 		MergeRefs: mergeRefs, SystemPrompt: WorkerSystemPrompt,
-	})
+	}
+	if r.worktreeBase != "" {
+		spec.Worktree = filepath.Join(r.worktreeBase, projectID, slug)
+	}
+	w := worker.New(spec)
 	w.TurnTimeout = r.turnTimeout
 
 	if err := w.Start(context.Background(), r.selfExe); err != nil {

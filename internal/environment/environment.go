@@ -57,6 +57,7 @@ func prepare(opts Options) (*setup, error) {
 	if err := os.MkdirAll(filepath.Dir(opts.DBPath), 0o755); err != nil {
 		return nil, err
 	}
+	worktreeBase := filepath.Join(filepath.Dir(opts.DBPath), "worktrees")
 	st, err := store.Open(opts.DBPath)
 	if err != nil {
 		return nil, err
@@ -74,7 +75,7 @@ func prepare(opts Options) (*setup, error) {
 		return nil, err
 	}
 
-	rn := runner.New(st, repo, opts.Base, self)
+	rn := runner.New(st, repo, opts.Base, self, worktreeBase)
 
 	port, err := freePort()
 	if err != nil {
