@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -203,6 +204,66 @@ func TestRenderGroupedSelectionOrder(t *testing.T) {
 	}
 	if strings.Contains(out, "branch: feat/loose") {
 		t.Errorf("index 0 should not expand the standalone task, got:\n%s", out)
+	}
+}
+
+// TestRenderWindowsToHeight drives render() with far more tasks than fit in a
+// small terminal and a selection near the bottom. The selected row must stay on
+// screen and an overflow indicator must signal the hidden rows above it.
+func TestRenderWindowsToHeight(t *testing.T) {
+	now := time.Now()
+	var tasks []*store.Task
+	for i := 0; i < 50; i++ {
+		tasks = append(tasks, &store.Task{
+			Slug:      fmt.Sprintf("task-%02d", i),
+			Status:    store.Running,
+			Result:    "working",
+			Branch:    fmt.Sprintf("feat/%02d", i),
+			UpdatedAt: now.Add(-time.Duration(i) * time.Minute),
+		})
+	}
+
+	out := render(view{
+		name:      "demo",
+		tasks:     tasks,
+		selected:  45, // near the bottom of the list
+		startedAt: now.Add(-time.Hour),
+		width:     100,
+		height:    24, // small enough that all 50 rows cannot fit
+		animate:   true,
+	})
+
+	// The selected row's slug and its expanded panel branch must be visible.
+	if !strings.Contains(out, "task-45") {
+		t.Errorf("windowed render dropped the selected row task-45:\n%s", out)
+	}
+	if !strings.Contains(out, "branch: feat/45") {
+		t.Errorf("windowed render dropped the selected row's expanded panel:\n%s", out)
+	}
+	// Rows above the window are hidden behind an overflow affordance.
+	if !strings.Contains(out, "↑") || !strings.Contains(out, "more") {
+		t.Errorf("expected an overflow indicator for hidden rows, got:\n%s", out)
+	}
+	// A row from the far top must have scrolled out of the window.
+	if strings.Contains(out, "task-00 ") {
+		t.Errorf("expected the top row task-00 to be windowed out, got:\n%s", out)
+	}
+	// Sanity: the windowed output must not exceed the terminal height.
+	if got := strings.Count(out, "\n"); got > 24 {
+		t.Errorf("windowed render produced %d lines, exceeding height 24:\n%s", got, out)
+	}
+}
+
+// TestRenderTinyHeightNoPanic exercises degenerate heights to confirm the
+// windowing math never panics on negative repeats or slice bounds.
+func TestRenderTinyHeightNoPanic(t *testing.T) {
+	now := time.Now()
+	var tasks []*store.Task
+	for i := 0; i < 10; i++ {
+		tasks = append(tasks, &store.Task{Slug: fmt.Sprintf("t-%d", i), Status: store.Done, UpdatedAt: now})
+	}
+	for _, h := range []int{0, 1, 2, 3, 5} {
+		render(view{name: "demo", tasks: tasks, selected: 9, startedAt: now, width: 100, height: h, animate: true})
 	}
 }
 
