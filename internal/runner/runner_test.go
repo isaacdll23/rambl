@@ -1138,6 +1138,68 @@ func TestRunFeatureTaskFailure(t *testing.T) {
 	wantErr(t, err, "bad")
 }
 
+// TestRunFeatureResumesWithoutRedispatchingDone proves resumability: a feature
+// whose tasks are already store.Done from a prior run (e.g. the loop died after
+// the work completed but before merge/PR) must finish on a fresh RunFeature
+// invocation — merging the done branches and opening the PR — WITHOUT trying to
+// re-dispatch the done tasks (Dispatch only accepts todo/failed/blocked, so a
+// re-dispatch would spuriously fail the whole feature).
+func TestRunFeatureResumesWithoutRedispatchingDone(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	f, err := h.st.AddFeature(h.projectID, "feat", "Feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	for _, slug := range []string{"t1", "t2"} {
+		if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, slug, slug, "do "+slug, nil); err != nil {
+			t.Fatalf("AddTaskToFeature %q: %v", slug, err)
+		}
+		// Prior run produced the task branch with disjoint changes...
+		h.commitTaskBranch(slug, slug+".txt", slug+"\n")
+		// ...and marked the task Done, but the loop died before merge/PR.
+		h.mutate(slug, func(tk *store.Task) {
+			tk.Status = store.Done
+			tk.Branch = "rambl/" + slug
+		})
+	}
+
+	// Any dispatch attempt on a Done task is a bug: record + fail if invoked.
+	var mu sync.Mutex
+	var dispatched []string
+	h.r.runTask = func(_, slug string) (store.Status, error) {
+		mu.Lock()
+		dispatched = append(dispatched, slug)
+		mu.Unlock()
+		return store.Failed, fmt.Errorf("runTask should not be called for already-Done task %q", slug)
+	}
+	var prCalls []string
+	h.r.openFeaturePRFn = func(_, featureSlug, _ string) (string, error) {
+		mu.Lock()
+		prCalls = append(prCalls, featureSlug)
+		mu.Unlock()
+		return "https://example/pr/1", nil
+	}
+
+	if err := h.r.RunFeature(h.projectID, "feat"); err != nil {
+		t.Fatalf("RunFeature (resume): %v", err)
+	}
+
+	if len(dispatched) != 0 {
+		t.Errorf("re-dispatched already-Done tasks %v, want none", dispatched)
+	}
+	if !equalStrings(prCalls, []string{"feat"}) {
+		t.Errorf("openFeaturePRFn calls = %v, want [feat]", prCalls)
+	}
+	// Both done branches got squash-merged onto the feature branch in topo order.
+	subj := featureCommitSubjects(t, h, "feat", 2)
+	if len(subj) != 2 || !strings.HasPrefix(subj[1], "feat(t1):") || !strings.HasPrefix(subj[0], "feat(t2):") {
+		t.Errorf("commit subjects = %v, want [feat(t2):..., feat(t1):...]", subj)
+	}
+}
+
 func equalStrings(got, want []string) bool {
 	if len(got) != len(want) {
 		return false

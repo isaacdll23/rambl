@@ -490,6 +490,21 @@ func (r *Runner) RunFeature(projectID, featureSlug string) error {
 		var wave []*store.Task
 		for _, t := range ordered {
 			if !dispatched[t.Slug] && depsReady(t, merged) {
+				// Resumability: a task already Done from a prior run (a timed-out
+				// loop, or a human completing/merging by hand) must NOT be
+				// re-dispatched — Dispatch only accepts todo/failed/blocked, so
+				// dispatching a Done task would spuriously fail the whole feature.
+				// Mark it dispatched (so we don't reconsider it) but leave it out
+				// of the wave; phase (b) will squash-merge it in topo order, which
+				// is a no-op for an already-merged branch.
+				cur, err := r.store.GetTask(projectID, t.Slug)
+				if err != nil {
+					return err
+				}
+				if cur != nil && cur.Status == store.Done {
+					dispatched[t.Slug] = true
+					continue
+				}
 				wave = append(wave, t)
 				dispatched[t.Slug] = true
 			}
