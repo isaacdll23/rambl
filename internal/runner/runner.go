@@ -404,15 +404,23 @@ func (r *Runner) apply(projectID, slug string, w *worker.Worker, turn worker.Tur
 }
 
 // classify maps a worker's final message to an outcome via the marker protocol.
+// The protocol requires the marker to be the final line of the worker's final
+// message, so classification inspects ONLY the last non-empty line — a marker
+// quoted earlier in the body (e.g. prose describing a test case) is ignored.
 func classify(reply string) (store.Status, string) {
-	if i := strings.LastIndex(reply, "RAMBL_BLOCKED:"); i >= 0 {
-		q := strings.TrimSpace(reply[i+len("RAMBL_BLOCKED:"):])
-		if nl := strings.IndexByte(q, '\n'); nl >= 0 {
-			q = strings.TrimSpace(q[:nl])
+	var last string
+	lines := strings.Split(reply, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+			last = trimmed
+			break
 		}
+	}
+	if strings.HasPrefix(last, "RAMBL_BLOCKED:") {
+		q := strings.TrimSpace(strings.TrimPrefix(last, "RAMBL_BLOCKED:"))
 		return store.NeedsInput, q
 	}
-	if strings.Contains(reply, "RAMBL_DONE") {
+	if last == "RAMBL_DONE" {
 		return store.Done, ""
 	}
 	return store.NeedsInput, "(worker ended its turn without a DONE or BLOCKED marker)"

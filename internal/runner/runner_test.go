@@ -146,10 +146,10 @@ func TestClassify(t *testing.T) {
 			wantQ:    "",
 		},
 		{
-			name:     "blocked keeps only first line",
-			reply:    "made progress\nRAMBL_BLOCKED: need a thing\nthis second line is dropped",
+			name:     "blocked on last line",
+			reply:    "made progress\nRAMBL_BLOCKED: need X",
 			wantStat: store.NeedsInput,
-			wantQ:    "need a thing",
+			wantQ:    "need X",
 		},
 		{
 			name:      "neither marker yields fallback question",
@@ -158,13 +158,30 @@ func TestClassify(t *testing.T) {
 			qNonEmpty: true,
 		},
 		{
-			// BLOCKED is matched first (via LastIndex) regardless of position,
-			// so a reply with an earlier DONE and a later BLOCKED classifies as
-			// NeedsInput — BLOCKED wins.
-			name:     "both done and later blocked -> blocked wins",
-			reply:    "Work complete.\nRAMBL_DONE\nActually wait:\nRAMBL_BLOCKED: actually blocked on X",
+			// The bug being fixed: a body that merely QUOTES the BLOCKED token in
+			// prose must not be classified as blocked when the final line is DONE.
+			name:     "blocked quoted in body, done on last line -> done",
+			reply:    "I considered emitting RAMBL_BLOCKED: need a thing but resolved it myself.\nRAMBL_DONE",
+			wantStat: store.Done,
+			wantQ:    "",
+		},
+		{
+			name:     "blocked on last non-empty line with trailing blanks",
+			reply:    "made progress\nRAMBL_BLOCKED: need X\n\n  \n",
 			wantStat: store.NeedsInput,
-			wantQ:    "actually blocked on X",
+			wantQ:    "need X",
+		},
+		{
+			name:     "done with trailing newline and whitespace",
+			reply:    "all green\nRAMBL_DONE\n  \n",
+			wantStat: store.Done,
+			wantQ:    "",
+		},
+		{
+			name:     "done quoted in body, prose on last line -> fallback",
+			reply:    "The marker RAMBL_DONE means the task is complete.\nStill working on it, will report back.",
+			wantStat: store.NeedsInput,
+			wantQ:    "(worker ended its turn without a DONE or BLOCKED marker)",
 		},
 	}
 	for _, tc := range tests {
