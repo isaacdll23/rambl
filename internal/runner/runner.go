@@ -61,6 +61,10 @@ type Runner struct {
 	mu      sync.Mutex
 	workers map[string]*worker.Worker     // keyed by task slug
 	cancels map[string]context.CancelFunc // per-worker run-cancel, keyed by task slug
+	// activeFeatures tracks feature slugs whose RunFeature loop is currently
+	// driving them, so manual dispatch can refuse to collide with the engine's
+	// own scheduling. Guarded by r.mu.
+	activeFeatures map[string]bool
 }
 
 // New constructs a Runner. selfExe is this binary's path (for workers' Stop hook).
@@ -76,6 +80,7 @@ func New(st *store.Store, repoPath, base, selfExe, worktreeBase string) *Runner 
 		pollInterval:       500 * time.Millisecond,
 		workers:            map[string]*worker.Worker{},
 		cancels:            map[string]context.CancelFunc{},
+		activeFeatures:     map[string]bool{},
 	}
 }
 
@@ -130,6 +135,39 @@ func (r *Runner) Dispatch(projectID, slug string) error {
 	}
 	go r.start(projectID, slug, t.Prompt, mergeRefs)
 	return nil
+}
+
+// DispatchManual is the entrypoint for human/PM-initiated dispatch. It refuses
+// to start a task that belongs to a feature whose RunFeature loop is currently
+// driving it (which would collide with the engine's own scheduling); otherwise
+// it behaves exactly like Dispatch.
+func (r *Runner) DispatchManual(projectID, slug string) error {
+	t, err := r.store.GetTask(projectID, slug)
+	if err != nil {
+		return err
+	}
+	if t == nil {
+		return fmt.Errorf("no task %q", slug)
+	}
+	if t.FeatureID != "" {
+		// Resolve the feature slug for t.FeatureID and check if its loop is active.
+		feats, err := r.store.ListFeatures(projectID)
+		if err != nil {
+			return err
+		}
+		for _, f := range feats {
+			if f.ID == t.FeatureID {
+				r.mu.Lock()
+				active := r.activeFeatures[f.Slug]
+				r.mu.Unlock()
+				if active {
+					return fmt.Errorf("task %q is managed by the running feature %q; let the engine schedule it (poll feature_status) — or wait for the feature to finish/fail before dispatching it manually", slug, f.Slug)
+				}
+				break
+			}
+		}
+	}
+	return r.Dispatch(projectID, slug)
 }
 
 func (r *Runner) start(projectID, slug, prompt string, mergeRefs []string) {
@@ -448,6 +486,18 @@ func (r *Runner) RunFeature(projectID, featureSlug string) error {
 	if f == nil {
 		return fmt.Errorf("no feature %q", featureSlug)
 	}
+
+	// Mark this feature's loop active so manual (human/PM) dispatch of its tasks
+	// is refused while the engine is scheduling them; clear it on every return.
+	r.mu.Lock()
+	r.activeFeatures[featureSlug] = true
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.activeFeatures, featureSlug)
+		r.mu.Unlock()
+	}()
+
 	tasks, err := r.store.TasksByFeature(projectID, f.ID)
 	if err != nil {
 		return err

@@ -262,6 +262,42 @@ func TestDispatchValidation(t *testing.T) {
 	// production seams — intentionally left untested.
 }
 
+// DispatchManual must refuse a task whose owning feature loop is live, but
+// behave like Dispatch for standalone tasks or tasks of non-active features.
+func TestDispatchManualGuard(t *testing.T) {
+	h := newHarness(t)
+
+	f, err := h.st.AddFeature(h.projectID, "auth", "Auth feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "login", "Login", "do login", nil); err != nil {
+		t.Fatalf("AddTaskToFeature login: %v", err)
+	}
+
+	// Feature loop active -> manual dispatch of its task is refused.
+	h.r.mu.Lock()
+	h.r.activeFeatures[f.Slug] = true
+	h.r.mu.Unlock()
+	wantErr(t, h.r.DispatchManual(h.projectID, "login"), "managed by the running feature")
+
+	// Feature loop NOT active -> guard does not fire; falls through to Dispatch.
+	h.r.mu.Lock()
+	delete(h.r.activeFeatures, f.Slug)
+	h.r.mu.Unlock()
+	if err := h.r.DispatchManual(h.projectID, "login"); err != nil &&
+		strings.Contains(err.Error(), "managed by the running feature") {
+		t.Fatalf("DispatchManual on non-active feature returned guard error: %v", err)
+	}
+
+	// Standalone task (no FeatureID) -> guard never applies.
+	h.addTask("solo", nil)
+	if err := h.r.DispatchManual(h.projectID, "solo"); err != nil &&
+		strings.Contains(err.Error(), "managed by the running feature") {
+		t.Fatalf("DispatchManual on standalone task returned guard error: %v", err)
+	}
+}
+
 // --- 3. Delete -------------------------------------------------------------
 
 func TestDelete(t *testing.T) {
