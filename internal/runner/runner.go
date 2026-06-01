@@ -315,6 +315,59 @@ func (r *Runner) Revise(projectID, slug, message string) error {
 	return nil
 }
 
+// OpenPR pushes the task's branch to origin and opens a GitHub PR via gh,
+// returning gh's output (the PR URL). Requires gh installed/authed and an
+// origin remote pointing at GitHub.
+func (r *Runner) OpenPR(projectID, slug, title, body string) (string, error) {
+	t, err := r.store.GetTask(projectID, slug)
+	if err != nil {
+		return "", err
+	}
+	if t == nil {
+		return "", fmt.Errorf("no task %q", slug)
+	}
+	if t.Branch == "" {
+		return "", fmt.Errorf("task %q has no branch to open a PR for", slug)
+	}
+	if title == "" {
+		title = t.Title
+	}
+	if body == "" {
+		body = "Automated by rambl."
+	}
+	base := r.defaultBase()
+	if out, err := worker.PushBranch(r.repoPath, "origin", t.Branch); err != nil {
+		return "", fmt.Errorf("git push failed: %v: %s", err, out)
+	}
+	cmd := exec.Command("gh", "pr", "create", "--base", base, "--head", t.Branch, "--title", title, "--body", body)
+	cmd.Dir = r.repoPath
+	cmd.Env = os.Environ()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh pr create failed (is gh installed and authenticated, and origin a GitHub remote?): %v: %s", err, string(out))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// defaultBase resolves the PR base branch from origin's HEAD symbolic ref,
+// falling back to "main".
+func (r *Runner) defaultBase() string {
+	cmd := exec.Command("git", "symbolic-ref", "refs/remotes/origin/HEAD")
+	cmd.Dir = r.repoPath
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "main"
+	}
+	ref := strings.TrimSpace(string(out))
+	if i := strings.LastIndex(ref, "/"); i >= 0 {
+		ref = strings.TrimSpace(ref[i+1:])
+	}
+	if ref == "" {
+		return "main"
+	}
+	return ref
+}
+
 // apply records the outcome of a completed turn and, on completion, commits and
 // retires the worker; on a block it leaves the worker alive for follow-up.
 func (r *Runner) apply(projectID, slug string, w *worker.Worker, turn worker.Turn) {

@@ -285,6 +285,11 @@ func DiffBranch(repoPath, base, branch string) (stat string, patch string, err e
 	return strings.TrimRight(stat, " \t\r\n"), strings.TrimRight(patch, " \t\r\n"), nil
 }
 
+// PushBranch pushes branch to remote, setting upstream. Returns combined output.
+func PushBranch(repoPath, remote, branch string) (string, error) {
+	return git(repoPath, "push", "-u", remote, branch)
+}
+
 func git(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir

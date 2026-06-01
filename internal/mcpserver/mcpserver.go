@@ -169,6 +169,25 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 		return mcp.NewToolResultText(fmt.Sprintf("revising %q; poll worker_status", slug)), nil
 	})
 
+	s.AddTool(mcp.NewTool("open_pr",
+		mcp.WithDescription("Push the task's rambl/<slug> branch to origin and open a GitHub pull request for the human to review. Only call after you have reviewed the diff (read_diff), validated the work (verify_task), and completed any needed revisions. Requires gh and an origin GitHub remote. Returns the PR URL."),
+		mcp.WithString("slug", mcp.Required(), mcp.Description("task slug to open a PR for")),
+		mcp.WithString("title", mcp.Description("PR title; defaults to the task title")),
+		mcp.WithString("body", mcp.Description("PR body, markdown")),
+	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		slug, err := req.RequireString("slug")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		title := req.GetString("title", "")
+		body := req.GetString("body", "")
+		url, err := rn.OpenPR(projectID, slug, title, body)
+		if err != nil {
+			return mcp.NewToolResultErrorf("open_pr: %v", err), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("opened PR for %q: %s", slug, url)), nil
+	})
+
 	return &Server{mcp: s}
 }
 
