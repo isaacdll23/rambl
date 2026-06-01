@@ -713,6 +713,112 @@ func TestMergeTaskIntoFeatureConflict(t *testing.T) {
 	}
 }
 
+// --- IntegrateFeature -------------------------------------------------------
+
+// startFeature adds a feature and starts its integration worktree, returning the
+// worktree path.
+func (h *harness) startFeature(slug string) string {
+	h.t.Helper()
+	if _, err := h.st.AddFeature(h.projectID, slug, slug+" feature"); err != nil {
+		h.t.Fatalf("AddFeature %q: %v", slug, err)
+	}
+	if _, err := h.r.StartFeature(h.projectID, slug); err != nil {
+		h.t.Fatalf("StartFeature %q: %v", slug, err)
+	}
+	return filepath.Join(h.worktreeBase, h.projectID, "@feat-"+slug)
+}
+
+func TestIntegrateFeatureGreenNoCommand(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	h.startFeature("nocmd") // worktree has only README — no go.mod
+
+	if err := h.r.IntegrateFeature(h.projectID, "nocmd"); err != nil {
+		t.Fatalf("IntegrateFeature: %v", err)
+	}
+	f, err := h.st.GetFeature(h.projectID, "nocmd")
+	if err != nil {
+		t.Fatalf("GetFeature: %v", err)
+	}
+	if f.Status != store.FeatureRunning {
+		t.Errorf("status = %q, want %q", f.Status, store.FeatureRunning)
+	}
+}
+
+func TestIntegrateFeatureGreenPassingBuild(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	wt := h.startFeature("greenbuild")
+
+	if err := os.WriteFile(filepath.Join(wt, "go.mod"), []byte("module gatecheck\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "lib.go"), []byte("package gatecheck\n\nfunc Add(a, b int) int { return a + b }\n"), 0o644); err != nil {
+		t.Fatalf("write lib.go: %v", err)
+	}
+	runGit(t, wt, "add", "-A")
+	runGit(t, wt, "commit", "-m", "add module")
+
+	if err := h.r.IntegrateFeature(h.projectID, "greenbuild"); err != nil {
+		t.Fatalf("IntegrateFeature: %v", err)
+	}
+	f, err := h.st.GetFeature(h.projectID, "greenbuild")
+	if err != nil {
+		t.Fatalf("GetFeature: %v", err)
+	}
+	if f.Status != store.FeatureRunning {
+		t.Errorf("status = %q, want %q", f.Status, store.FeatureRunning)
+	}
+}
+
+func TestIntegrateFeatureEscalation(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	wt := h.startFeature("breakbuild")
+	h.r.maxResolveAttempts = 1
+	// Make the resolve session's Start fail fast (no real Claude binary).
+	t.Setenv("CLAUDE_PATH", filepath.Join(t.TempDir(), "no-claude"))
+
+	if err := os.WriteFile(filepath.Join(wt, "go.mod"), []byte("module gatecheck\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	// A .go file that does not compile.
+	if err := os.WriteFile(filepath.Join(wt, "broken.go"), []byte("package gatecheck\n\nfunc Broken( {\n"), 0o644); err != nil {
+		t.Fatalf("write broken.go: %v", err)
+	}
+	runGit(t, wt, "add", "-A")
+	runGit(t, wt, "commit", "-m", "add broken module")
+
+	err := h.r.IntegrateFeature(h.projectID, "breakbuild")
+	var esc *IntegrationEscalation
+	if !errors.As(err, &esc) {
+		t.Fatalf("expected *IntegrationEscalation, got %v", err)
+	}
+	if esc.Attempts != 1 {
+		t.Errorf("Attempts = %d, want 1", esc.Attempts)
+	}
+	if strings.TrimSpace(esc.Output) == "" {
+		t.Errorf("expected non-empty build-failure output")
+	}
+}
+
+func TestIntegrateFeatureNoWorktree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	if _, err := h.st.AddFeature(h.projectID, "unstarted", "Unstarted feature"); err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	wantErr(t, h.r.IntegrateFeature(h.projectID, "unstarted"), "no integration worktree")
+}
+
 func slugs(tasks []*store.Task) []string {
 	out := make([]string, len(tasks))
 	for i, t := range tasks {

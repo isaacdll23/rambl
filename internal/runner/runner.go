@@ -46,6 +46,8 @@ type Runner struct {
 	worktreeBase string
 	turnTimeout  time.Duration
 
+	maxResolveAttempts int // integration-gate resolve-session budget
+
 	mu      sync.Mutex
 	workers map[string]*worker.Worker // keyed by task slug
 }
@@ -57,9 +59,10 @@ func New(st *store.Store, repoPath, base, selfExe, worktreeBase string) *Runner 
 	}
 	return &Runner{
 		store: st, repoPath: repoPath, base: base, selfExe: selfExe,
-		worktreeBase: worktreeBase,
-		turnTimeout:  5 * time.Minute,
-		workers:      map[string]*worker.Worker{},
+		worktreeBase:       worktreeBase,
+		turnTimeout:        5 * time.Minute,
+		maxResolveAttempts: 2,
+		workers:            map[string]*worker.Worker{},
 	}
 }
 
@@ -451,6 +454,126 @@ func (r *Runner) Verify(projectID, slug, command string) (string, error) {
 		result = fmt.Sprintf("VERIFY FAILED (%v)\n\n", runErr)
 	}
 	return result + output, nil
+}
+
+// IntegrationEscalation reports that the integration gate could not make the
+// feature branch build and test green within its attempt budget. Detect with errors.As.
+type IntegrationEscalation struct {
+	Feature  string
+	Attempts int
+	Output   string // last build/test output
+}
+
+func (e *IntegrationEscalation) Error() string {
+	return fmt.Sprintf("integration gate could not make feature %q green after %d attempt(s)", e.Feature, e.Attempts)
+}
+
+// detectVerifyCommand returns the auto-detected build/test command for dir. It
+// recognises a Go module (go.mod) and returns (cmd, true); otherwise ("", false).
+func detectVerifyCommand(dir string) (string, bool) {
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+		return "go build ./... && go test ./...", true
+	}
+	return "", false
+}
+
+// runVerify runs command in dir and returns its combined output (truncated to
+// 30000 bytes like Verify) and ok = (the command exited zero).
+func runVerify(dir, command string) (output string, ok bool) {
+	cmd := exec.Command("sh", "-c", command)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	out, runErr := cmd.CombinedOutput()
+	output = string(out)
+	if len(output) > 30000 {
+		origLen := len(output)
+		output = output[:30000] + fmt.Sprintf("\n... [output truncated at 30000 of %d bytes]", origLen)
+	}
+	return output, runErr == nil
+}
+
+// IntegrateFeature ensures the feature's integration worktree builds and tests green.
+// It runs the detected build/test command in the feature worktree; if it fails, it runs
+// up to r.maxResolveAttempts resolve-only autonomous sessions (each instructed to fix
+// ONLY build/test breakage — no new features, no behavior changes), committing each
+// session's changes to the feature branch and re-running the command. Returns nil once
+// green; *IntegrationEscalation when the attempt budget is exhausted; a plain error on
+// infrastructure failure (e.g. missing worktree). Sets Feature.Status = FeatureIntegrating
+// while running and restores it to FeatureRunning on success; leaves status unchanged on
+// escalation (the caller decides how to surface it).
+func (r *Runner) IntegrateFeature(projectID, featureSlug string) error {
+	f, err := r.store.GetFeature(projectID, featureSlug)
+	if err != nil {
+		return err
+	}
+	if f == nil {
+		return fmt.Errorf("no feature %q", featureSlug)
+	}
+	wt := r.featureWorktree(projectID, featureSlug)
+	if _, err := os.Stat(wt); err != nil {
+		return fmt.Errorf("no integration worktree for feature %q (start it first)", featureSlug)
+	}
+
+	f.Status = store.FeatureIntegrating
+	_ = r.store.UpdateFeature(f)
+
+	markRunning := func() error {
+		f.Status = store.FeatureRunning
+		_ = r.store.UpdateFeature(f)
+		return nil
+	}
+
+	cmd, ok := detectVerifyCommand(wt)
+	if !ok {
+		// Nothing to verify — vacuously green.
+		return markRunning()
+	}
+
+	output, green := runVerify(wt, cmd)
+	if green {
+		return markRunning()
+	}
+
+	for attempt := 1; attempt <= r.maxResolveAttempts; attempt++ {
+		resolvePrompt := fmt.Sprintf(`The feature integration branch currently FAILS the command:
+
+    %s
+
+Here is the failing build/test output:
+
+%s
+
+Fix ONLY what is necessary to make `+"`%s`"+` pass. Do NOT add features, change public
+behavior, or touch unrelated files. Keep the change minimal and focused on the breakage.`,
+			cmd, output, cmd)
+
+		spec := worker.Spec{
+			ID:           "feat-" + featureSlug + "-integrate",
+			Prompt:       resolvePrompt,
+			RepoPath:     r.repoPath,
+			Worktree:     wt,
+			Branch:       featureBranch(featureSlug),
+			Reopen:       true,
+			SystemPrompt: WorkerSystemPrompt,
+		}
+		w := worker.New(spec)
+		w.TurnTimeout = r.turnTimeout
+		if err := w.Start(context.Background(), r.selfExe); err != nil {
+			// A failed session is an unproductive attempt, not a hard error.
+			output += fmt.Sprintf("\n\n[resolve attempt %d: session start failed: %v]", attempt, err)
+			continue
+		}
+		_, _ = w.Run(context.Background())
+		_ = w.Commit(fmt.Sprintf("fix(%s): integration gate resolve", featureSlug))
+		_ = w.Close()
+
+		output, green = runVerify(wt, cmd)
+		if green {
+			return markRunning()
+		}
+	}
+
+	return &IntegrationEscalation{Feature: featureSlug, Attempts: r.maxResolveAttempts, Output: output}
 }
 
 // Revise hands a finished task's branch back to a worker with feedback so it

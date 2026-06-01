@@ -32,6 +32,15 @@ func newRepo(t *testing.T) string {
 	return repo
 }
 
+func TestBranchName(t *testing.T) {
+	if got := branchName(Spec{ID: "login"}); got != "rambl/login" {
+		t.Errorf("branchName with empty Branch = %q, want rambl/login", got)
+	}
+	if got := branchName(Spec{ID: "login", Branch: "rambl/feat/auth"}); got != "rambl/feat/auth" {
+		t.Errorf("branchName with explicit Branch = %q, want rambl/feat/auth", got)
+	}
+}
+
 func TestCleanupWorktree(t *testing.T) {
 	repo := newRepo(t)
 	wtPath := filepath.Join(t.TempDir(), "wt")
