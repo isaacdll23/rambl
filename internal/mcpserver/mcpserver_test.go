@@ -386,6 +386,128 @@ func TestCreateSummary(t *testing.T) {
 	}
 }
 
+// TestFeatureToolsOverHTTP exercises the feature tool surface (create_feature,
+// create_task with feature=, feature_status) over the real streamable-HTTP
+// transport. dispatch_feature is NOT called here (it would spawn real workers);
+// this covers schema + create/read against the store.
+func TestFeatureToolsOverHTTP(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	proj, err := st.EnsureProject("/repo/calc", "calc")
+	if err != nil {
+		t.Fatalf("project: %v", err)
+	}
+	rn := runner.New(st, "/repo/calc", "HEAD", "/usr/bin/true", "")
+	srv := New(st, rn, proj)
+
+	httpSrv := server.NewTestStreamableHTTPServer(srv.mcp)
+	defer httpSrv.Close()
+
+	ctx := context.Background()
+	cli, err := mcpclient.NewStreamableHttpClient(httpSrv.URL)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	if err := cli.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if _, err := cli.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: "test", Version: "1.0.0"},
+		},
+	}); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+
+	// Feature tools advertised.
+	tools, err := cli.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	want := map[string]bool{"create_feature": false, "dispatch_feature": false, "feature_status": false}
+	for _, tool := range tools.Tools {
+		if _, ok := want[tool.Name]; ok {
+			want[tool.Name] = true
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Errorf("tool %q not advertised", name)
+		}
+	}
+
+	// create_feature.
+	mustCall(t, cli, ctx, "create_feature", map[string]any{"slug": "auth", "title": "Auth"})
+
+	// create_task into the feature, then a dependent task into the same feature.
+	mustCall(t, cli, ctx, "create_task", map[string]any{
+		"slug": "login", "title": "Login", "prompt": "build login", "feature": "auth",
+	})
+	mustCall(t, cli, ctx, "create_task", map[string]any{
+		"slug": "logout", "title": "Logout", "prompt": "build logout", "feature": "auth", "deps": []string{"login"},
+	})
+
+	// create_task into a nonexistent feature -> error result.
+	if res := errCall(t, cli, ctx, "create_task", map[string]any{
+		"slug": "ghost-task", "title": "Ghost", "prompt": "x", "feature": "ghost",
+	}); !strings.Contains(textOf(t, res), "no feature") {
+		t.Fatalf("create_task ghost feature: want 'no feature' error, got %q", textOf(t, res))
+	}
+
+	type fview struct {
+		Slug   string `json:"slug"`
+		Status string `json:"status"`
+		Branch string `json:"branch"`
+		Tasks  []struct {
+			Slug string   `json:"slug"`
+			Deps []string `json:"deps"`
+		} `json:"tasks"`
+	}
+
+	// feature_status with a slug returns exactly that feature with its tasks.
+	res := mustCall(t, cli, ctx, "feature_status", map[string]any{"slug": "auth"})
+	var one []fview
+	if err := json.Unmarshal([]byte(textOf(t, res)), &one); err != nil {
+		t.Fatalf("feature_status json: %v\n%s", err, textOf(t, res))
+	}
+	if len(one) != 1 {
+		t.Fatalf("want 1 feature, got %d: %s", len(one), textOf(t, res))
+	}
+	if one[0].Slug != "auth" || one[0].Status != "planning" {
+		t.Fatalf("feature = %+v, want slug=auth status=planning", one[0])
+	}
+	if len(one[0].Tasks) != 2 {
+		t.Fatalf("want 2 tasks, got %d: %+v", len(one[0].Tasks), one[0].Tasks)
+	}
+	var logoutDeps []string
+	taskSlugs := map[string]bool{}
+	for _, tk := range one[0].Tasks {
+		taskSlugs[tk.Slug] = true
+		if tk.Slug == "logout" {
+			logoutDeps = tk.Deps
+		}
+	}
+	if !taskSlugs["login"] || !taskSlugs["logout"] {
+		t.Fatalf("want tasks login+logout, got %+v", one[0].Tasks)
+	}
+	if len(logoutDeps) != 1 || logoutDeps[0] != "login" {
+		t.Fatalf("logout deps = %v, want [login]", logoutDeps)
+	}
+
+	// feature_status with no slug returns all features (just auth here).
+	res = mustCall(t, cli, ctx, "feature_status", nil)
+	var all []fview
+	if err := json.Unmarshal([]byte(textOf(t, res)), &all); err != nil {
+		t.Fatalf("feature_status (all) json: %v\n%s", err, textOf(t, res))
+	}
+	if len(all) != 1 || all[0].Slug != "auth" {
+		t.Fatalf("feature_status (all) = %+v, want one feature auth", all)
+	}
+}
+
 func mustCall(t *testing.T, cli *mcpclient.Client, ctx context.Context, name string, args map[string]any) *mcp.CallToolResult {
 	t.Helper()
 	req := mcp.CallToolRequest{}
