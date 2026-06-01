@@ -110,6 +110,9 @@ configured MCP servers, since it's an ordinary Claude Code session.
 
 ## Releasing
 
+<details>
+<summary>Cutting a release</summary>
+
 Releases are cut by [Woodpecker CI](.woodpecker.yml): every push runs
 `go vet` / `go test -race` / `go build`, and pushing a `v*` tag triggers
 [GoReleaser](.goreleaser.yaml), which cross-compiles the linux/darwin ×
@@ -124,6 +127,7 @@ git push origin v0.1.0   # Woodpecker builds and publishes the release
 
 CI needs a `github_token` secret (a GitHub token with `repo` scope) configured on
 the Woodpecker repo.
+</details>
 
 ## Notes & limits
 
