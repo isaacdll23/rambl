@@ -76,12 +76,13 @@ go build -o rambl ./cmd/rambl
 ## Use
 
 ```sh
-cd /path/to/your/git/repo
-echo ".rambl/" >> .gitignore        # workers create worktrees under .rambl/
-
-rambl                                # talk to the PM; it plans and builds
-rambl monitor                        # in another pane: watch the workers (read-only)
+rambl                # in a git repo: launches here. Elsewhere: pick a repo from the TUI
+rambl pick           # always choose a repo from the TUI, then launch
+rambl monitor        # in another pane: watch the workers (read-only)
 ```
+
+Worktrees and state both live under `~/.rambl/`, so the repo stays pristine —
+no `.gitignore` changes needed.
 
 Then review the work:
 
@@ -94,7 +95,8 @@ git diff main..rambl/<task>
 
 | command | what it does |
 |---|---|
-| `rambl` | launch the PM environment in the current repo |
+| `rambl` | launch the PM in the current repo, or pick one from a TUI if you're not in a repo |
+| `rambl pick` | choose a repo from a TUI, then launch the PM environment |
 | `rambl pm -repo <path> [-model <m>]` | explicit environment launch |
 | `rambl monitor -repo <path> [--once]` | read-only worker dashboard |
 | `rambl env-once -repo <path> -brief <text>` | drive the PM through one brief (non-interactive) |
