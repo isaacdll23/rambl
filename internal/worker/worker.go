@@ -31,6 +31,7 @@ type Spec struct {
 	Base         string   // base ref for the worktree branch (default "HEAD")
 	MergeRefs    []string // refs (dependency branches) merged into the worktree before running
 	SystemPrompt string   // appended to the worker's system prompt (autonomy + outcome protocol)
+	Worktree     string   // explicit absolute worktree path; if empty, defaults to <RepoPath>/.rambl/worktrees/<ID>
 }
 
 // Turn is the outcome of one prompt→completion cycle.
@@ -68,7 +69,11 @@ func New(spec Spec) *Worker {
 // transcript tailer, and spawns the autonomous session (ready for Send).
 func (w *Worker) Start(ctx context.Context, selfExe string) error {
 	w.Branch = "rambl/" + w.Spec.ID
-	w.Worktree = filepath.Join(w.Spec.RepoPath, ".rambl", "worktrees", w.Spec.ID)
+	if w.Spec.Worktree != "" {
+		w.Worktree = w.Spec.Worktree
+	} else {
+		w.Worktree = filepath.Join(w.Spec.RepoPath, ".rambl", "worktrees", w.Spec.ID)
+	}
 
 	if err := os.MkdirAll(filepath.Dir(w.Worktree), 0o755); err != nil {
 		return err

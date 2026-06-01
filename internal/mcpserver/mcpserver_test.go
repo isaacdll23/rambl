@@ -26,7 +26,7 @@ func TestMCPToolsOverHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("project: %v", err)
 	}
-	rn := runner.New(st, "/repo/calc", "HEAD", "/usr/bin/true")
+	rn := runner.New(st, "/repo/calc", "HEAD", "/usr/bin/true", "")
 	srv := New(st, rn, proj)
 
 	httpSrv := server.NewTestStreamableHTTPServer(srv.mcp)
