@@ -25,10 +25,10 @@ you ⇄ rambl  (one environment process)
 ```
 
 It deliberately drives the real interactive `claude` CLI (never `claude -p` or
-the Agent SDK), which is what keeps usage on your subscription. See
-[`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and
-[`docs/claude-code-internals.md`](docs/claude-code-internals.md) for the
-low-level mechanics.
+the Agent SDK), which is what keeps usage on your subscription — see
+[ADR 0001](docs/adr/0001-drive-interactive-cli-for-subscription-billing.md).
+Workers are isolated in out-of-repo git worktrees
+([ADR 0002](docs/adr/0002-worktree-isolated-workers.md)).
 
 ## Requirements
 

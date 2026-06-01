@@ -1,6 +1,5 @@
 # compiled binary
 /rambl
-/defined
 
 # release artifacts (goreleaser)
 /dist/
@@ -13,4 +12,3 @@
 
 # os
 .DS_Store
-.rambl/
