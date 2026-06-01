@@ -38,10 +38,12 @@ func Once(dbPath, repoPath string) error {
 	if err != nil {
 		return err
 	}
+	features, _ := st.ListFeatures(projectID) // nil on error degrades to a flat list
 	fmt.Print(render(view{
 		name:      name,
 		tasks:     tasks,
 		events:    events,
+		features:  features,
 		startedAt: time.Now(),
 		width:     100,
 		animate:   false,
@@ -92,6 +94,7 @@ type model struct {
 	name      string
 	tasks     []*store.Task
 	events    []*store.Event
+	features  []*store.Feature
 	err       error
 	width     int
 	height    int
@@ -102,9 +105,10 @@ type model struct {
 
 // dataMsg carries a fresh poll of both tasks and events.
 type dataMsg struct {
-	tasks  []*store.Task
-	events []*store.Event
-	err    error
+	tasks    []*store.Task
+	events   []*store.Event
+	features []*store.Feature
+	err      error
 }
 
 // dataTickMsg fires once a second and triggers a DB re-fetch.
@@ -120,7 +124,8 @@ func (m model) fetch() tea.Cmd {
 			return dataMsg{err: err}
 		}
 		ev, err := m.store.RecentEvents(m.projectID, 20)
-		return dataMsg{tasks: ts, events: ev, err: err}
+		ft, _ := m.store.ListFeatures(m.projectID) // nil on error degrades to a flat list
+		return dataMsg{tasks: ts, events: ev, features: ft, err: err}
 	}
 }
 
@@ -152,7 +157,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 	case dataMsg:
-		m.tasks, m.events, m.err = msg.tasks, msg.events, msg.err
+		m.tasks, m.events, m.features, m.err = msg.tasks, msg.events, msg.features, msg.err
 		// clamp the cursor if the task count shrank between polls
 		if m.selected >= len(m.tasks) {
 			m.selected = len(m.tasks) - 1
@@ -177,6 +182,7 @@ func (m model) View() string {
 		name:      m.name,
 		tasks:     m.tasks,
 		events:    m.events,
+		features:  m.features,
 		frame:     m.frame,
 		selected:  m.selected,
 		startedAt: m.startedAt,
@@ -202,6 +208,15 @@ var (
 	}
 	spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	idleFrames    = []string{"·", "•", "●", "•"}
+	// featureStatusColor maps a feature's lifecycle to the same palette the task
+	// statuses use, so a feature header reads at a glance alongside its rows.
+	featureStatusColor = map[store.FeatureStatus]lipgloss.Color{
+		store.FeaturePlanning:    lipgloss.Color("245"), // grey
+		store.FeatureRunning:     lipgloss.Color("39"),  // blue
+		store.FeatureIntegrating: lipgloss.Color("214"), // orange
+		store.FeatureDone:        lipgloss.Color("42"),  // green
+		store.FeatureFailed:      lipgloss.Color("203"), // red
+	}
 )
 
 // view is the full set of inputs the pure renderer needs. Keeping it a plain
@@ -210,6 +225,7 @@ type view struct {
 	name      string
 	tasks     []*store.Task
 	events    []*store.Event
+	features  []*store.Feature
 	frame     int
 	selected  int
 	startedAt time.Time
@@ -345,24 +361,102 @@ func renderWorkers(v view, width int) string {
 	const fixed = 2 + 1 + 1 + 11 + 1 + 16 + 1 + 5 + 1
 	detailMax := maxInt(width-fixed, 8)
 
-	for i, t := range v.tasks {
-		g := lipgloss.NewStyle().Foreground(statusColor[t.Status]).Render(glyph(t.Status, v.frame, v.animate))
-		statusCell := lipgloss.NewStyle().Foreground(statusColor[t.Status]).Render(fmt.Sprintf("%-11s", string(t.Status)))
-		slug := fmt.Sprintf("%-16s", truncate(t.Slug, 16))
-		row := fmt.Sprintf("%s %s %s %-5s %s", g, statusCell, slug, age(t.UpdatedAt), truncate(detailOf(t), detailMax))
-
-		marker := "  "
-		if i == v.selected {
-			marker = lipgloss.NewStyle().Foreground(statusColor[t.Status]).Bold(true).Render("▌ ")
-			row = lipgloss.NewStyle().Bold(true).Render(row)
+	// Build the grouped display order. `selected` indexes this flat sequence.
+	groups := groupTasks(v.tasks, v.features)
+	grouped := false
+	for _, grp := range groups {
+		if grp.feature != nil {
+			grouped = true
+			break
 		}
-		b.WriteString(marker + row + "\n")
+	}
 
-		if i == v.selected {
-			b.WriteString(renderExpanded(t, width))
+	idx := 0 // running position in the flat grouped order, matched against v.selected
+	for _, grp := range groups {
+		if grouped {
+			if grp.feature != nil {
+				b.WriteString(renderFeatureHeader(grp.feature))
+			} else {
+				b.WriteString(faintStyle.Render("▸ standalone"))
+			}
+			b.WriteString("\n")
+		}
+		for _, t := range grp.tasks {
+			g := lipgloss.NewStyle().Foreground(statusColor[t.Status]).Render(glyph(t.Status, v.frame, v.animate))
+			statusCell := lipgloss.NewStyle().Foreground(statusColor[t.Status]).Render(fmt.Sprintf("%-11s", string(t.Status)))
+			slug := fmt.Sprintf("%-16s", truncate(t.Slug, 16))
+			row := fmt.Sprintf("%s %s %s %-5s %s", g, statusCell, slug, age(t.UpdatedAt), truncate(detailOf(t), detailMax))
+
+			marker := "  "
+			if idx == v.selected {
+				marker = lipgloss.NewStyle().Foreground(statusColor[t.Status]).Bold(true).Render("▌ ")
+				row = lipgloss.NewStyle().Bold(true).Render(row)
+			}
+			indent := ""
+			if grouped {
+				indent = "  " // nest rows under their feature header
+			}
+			b.WriteString(indent + marker + row + "\n")
+
+			if idx == v.selected {
+				b.WriteString(renderExpanded(t, width))
+			}
+			idx++
 		}
 	}
 	return b.String()
+}
+
+// taskGroup is one bucket in the grouped WORKERS view: a feature (nil for the
+// standalone bucket) and the tasks that belong to it.
+type taskGroup struct {
+	feature *store.Feature
+	tasks   []*store.Task
+}
+
+// groupTasks orders tasks for display: each feature (slug order, only those that
+// own at least one task) followed by its rows, then the standalone tasks. A task
+// whose FeatureID references a feature not in the list falls back to standalone
+// rather than being dropped. With no features at all, it returns a single
+// standalone group, which the renderer prints flat (no headers, no indent).
+func groupTasks(tasks []*store.Task, features []*store.Feature) []taskGroup {
+	byFeature := map[string][]*store.Task{}
+	known := map[string]bool{}
+	for _, f := range features {
+		known[f.ID] = true
+	}
+	var standalone []*store.Task
+	for _, t := range tasks {
+		if t.FeatureID != "" && known[t.FeatureID] {
+			byFeature[t.FeatureID] = append(byFeature[t.FeatureID], t)
+		} else {
+			standalone = append(standalone, t)
+		}
+	}
+	var groups []taskGroup
+	for _, f := range features {
+		ts := byFeature[f.ID]
+		if len(ts) == 0 {
+			continue
+		}
+		groups = append(groups, taskGroup{feature: f, tasks: ts})
+	}
+	if len(standalone) > 0 {
+		groups = append(groups, taskGroup{tasks: standalone})
+	}
+	return groups
+}
+
+// renderFeatureHeader prints the `▸ feat <slug>  <status>  <branch>` line that
+// introduces a feature's rows, colored by the feature's lifecycle status.
+func renderFeatureHeader(f *store.Feature) string {
+	branch := f.Branch
+	if branch == "" {
+		branch = "-"
+	}
+	head := lipgloss.NewStyle().Foreground(featureStatusColor[f.Status]).Bold(true).
+		Render(fmt.Sprintf("▸ feat %s", f.Slug))
+	return head + faintStyle.Render(fmt.Sprintf("  %s  %s", string(f.Status), branch))
 }
 
 func renderExpanded(t *store.Task, width int) string {
