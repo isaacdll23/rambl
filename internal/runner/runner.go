@@ -46,6 +46,18 @@ type Runner struct {
 	worktreeBase string
 	turnTimeout  time.Duration
 
+	maxResolveAttempts int // integration-gate resolve-session budget
+
+	pollInterval time.Duration // dispatchAndWait store-poll cadence
+	// runTask dispatches a task and blocks until it reaches a terminal status.
+	// nil in production (falls back to dispatchAndWait); overridden in tests to
+	// drive scheduling without spawning real Claude sessions.
+	runTask func(projectID, slug string) (store.Status, error)
+	// openFeaturePRFn opens the feature's PR once it is merged and green. nil in
+	// production (falls back to OpenFeaturePR); overridden in tests to assert the
+	// auto-PR step fires without a real push/gh call.
+	openFeaturePRFn func(projectID, featureSlug, body string) (string, error)
+
 	mu      sync.Mutex
 	workers map[string]*worker.Worker // keyed by task slug
 }
@@ -57,9 +69,11 @@ func New(st *store.Store, repoPath, base, selfExe, worktreeBase string) *Runner 
 	}
 	return &Runner{
 		store: st, repoPath: repoPath, base: base, selfExe: selfExe,
-		worktreeBase: worktreeBase,
-		turnTimeout:  5 * time.Minute,
-		workers:      map[string]*worker.Worker{},
+		worktreeBase:       worktreeBase,
+		turnTimeout:        5 * time.Minute,
+		maxResolveAttempts: 2,
+		pollInterval:       500 * time.Millisecond,
+		workers:            map[string]*worker.Worker{},
 	}
 }
 
@@ -323,6 +337,201 @@ func TopoOrder(tasks []*store.Task) ([]*store.Task, error) {
 	return ordered, nil
 }
 
+// dispatchAndWait dispatches a task and blocks until it reaches a terminal status
+// (Done, Failed, Blocked, or NeedsInput), polling the store every r.pollInterval.
+func (r *Runner) dispatchAndWait(projectID, slug string) (store.Status, error) {
+	if err := r.Dispatch(projectID, slug); err != nil {
+		return store.Failed, err
+	}
+	for {
+		t, err := r.store.GetTask(projectID, slug)
+		if err != nil {
+			return store.Failed, err
+		}
+		if t != nil {
+			switch t.Status {
+			case store.Done, store.Failed, store.Blocked, store.NeedsInput:
+				return t.Status, nil
+			}
+		}
+		time.Sleep(r.pollInterval)
+	}
+}
+
+// execRunTask runs a task to a terminal status using r.runTask when set (tests),
+// else the real dispatchAndWait path (production).
+func (r *Runner) execRunTask(projectID, slug string) (store.Status, error) {
+	if r.runTask != nil {
+		return r.runTask(projectID, slug)
+	}
+	return r.dispatchAndWait(projectID, slug)
+}
+
+// DispatchableFeatureTasks returns the feature's tasks that are ready to dispatch now:
+// status Todo, and every in-feature dependency (a dep whose slug names another task in
+// the same feature) already present in `merged`. Deps that name tasks outside the feature
+// are ignored. Result is ordered by slug.
+func (r *Runner) DispatchableFeatureTasks(projectID, featureSlug string, merged map[string]bool) ([]*store.Task, error) {
+	f, err := r.store.GetFeature(projectID, featureSlug)
+	if err != nil {
+		return nil, err
+	}
+	if f == nil {
+		return nil, fmt.Errorf("no feature %q", featureSlug)
+	}
+	tasks, err := r.store.TasksByFeature(projectID, f.ID)
+	if err != nil {
+		return nil, err
+	}
+	inFeature := make(map[string]bool, len(tasks))
+	for _, t := range tasks {
+		inFeature[t.Slug] = true
+	}
+	var ready []*store.Task
+	for _, t := range tasks {
+		if t.Status != store.Todo {
+			continue
+		}
+		ok := true
+		for _, dep := range t.Deps {
+			if inFeature[dep] && !merged[dep] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			ready = append(ready, t)
+		}
+	}
+	sort.Slice(ready, func(i, j int) bool { return ready[i].Slug < ready[j].Slug })
+	return ready, nil
+}
+
+// RunFeature drives a feature end-to-end. It starts the feature branch+worktree, then
+// repeatedly (a) dispatches every not-yet-dispatched task whose in-feature deps are all
+// merged, in parallel, and (b) squash-merges completed tasks into the feature branch in
+// TopoOrder, running the integration gate after each merge. It blocks until all the
+// feature's tasks are merged and the branch is green, returning nil; or returns an error
+// on the first task that fails/blocks, the first merge conflict, or a gate escalation.
+func (r *Runner) RunFeature(projectID, featureSlug string) error {
+	if _, err := r.StartFeature(projectID, featureSlug); err != nil {
+		return err
+	}
+	f, err := r.store.GetFeature(projectID, featureSlug)
+	if err != nil {
+		return err
+	}
+	if f == nil {
+		return fmt.Errorf("no feature %q", featureSlug)
+	}
+	tasks, err := r.store.TasksByFeature(projectID, f.ID)
+	if err != nil {
+		return err
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
+	ordered, err := TopoOrder(tasks)
+	if err != nil {
+		return err
+	}
+
+	// In-feature dependency set, to distinguish deps that gate scheduling from
+	// deps referencing tasks outside this feature (which are ignored).
+	inFeature := make(map[string]bool, len(ordered))
+	for _, t := range ordered {
+		inFeature[t.Slug] = true
+	}
+	depsReady := func(t *store.Task, merged map[string]bool) bool {
+		for _, dep := range t.Deps {
+			if inFeature[dep] && !merged[dep] {
+				return false
+			}
+		}
+		return true
+	}
+
+	merged := map[string]bool{}
+	dispatched := map[string]bool{}
+	mergeIdx := 0
+
+	for mergeIdx < len(ordered) {
+		// (a) Dispatch wave: every not-yet-dispatched task whose in-feature deps
+		// are all merged, concurrently.
+		type result struct {
+			slug   string
+			status store.Status
+			err    error
+		}
+		var wave []*store.Task
+		for _, t := range ordered {
+			if !dispatched[t.Slug] && depsReady(t, merged) {
+				wave = append(wave, t)
+				dispatched[t.Slug] = true
+			}
+		}
+		var results []result
+		if len(wave) > 0 {
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			for _, t := range wave {
+				wg.Add(1)
+				go func(slug string) {
+					defer wg.Done()
+					status, err := r.execRunTask(projectID, slug)
+					mu.Lock()
+					results = append(results, result{slug: slug, status: status, err: err})
+					mu.Unlock()
+				}(t.Slug)
+			}
+			wg.Wait()
+			for _, res := range results {
+				if res.status != store.Done || res.err != nil {
+					return fmt.Errorf("feature %q task %q did not complete (status %s): %w",
+						featureSlug, res.slug, res.status, res.err)
+				}
+			}
+		}
+
+		// (b) Merge as far as possible in topo order.
+		mergedThisRound := false
+		for mergeIdx < len(ordered) {
+			slug := ordered[mergeIdx].Slug
+			t, err := r.store.GetTask(projectID, slug)
+			if err != nil {
+				return err
+			}
+			if t == nil || t.Status != store.Done {
+				break // not ready to merge yet — go dispatch the next wave
+			}
+			if err := r.MergeTaskIntoFeature(projectID, featureSlug, slug); err != nil {
+				return err
+			}
+			if err := r.IntegrateFeature(projectID, featureSlug); err != nil {
+				return err
+			}
+			merged[slug] = true
+			mergeIdx++
+			mergedThisRound = true
+		}
+
+		// (c) Safety: a full iteration with no progress and not all merged is a stall.
+		if len(wave) == 0 && !mergedThisRound && mergeIdx < len(ordered) {
+			return fmt.Errorf("feature %q stalled: no dispatchable or mergeable tasks", featureSlug)
+		}
+	}
+
+	// All tasks merged: run a final integration gate so we never open a PR on a
+	// red branch, then auto-open the feature PR.
+	if err := r.IntegrateFeature(projectID, featureSlug); err != nil {
+		return err
+	}
+	if _, err := r.execOpenFeaturePR(projectID, featureSlug, ""); err != nil {
+		return fmt.Errorf("feature %q merged and green but opening PR failed: %w", featureSlug, err)
+	}
+	return nil
+}
+
 // CleanupFeature best-effort removes the feature's integration worktree and branch.
 func (r *Runner) CleanupFeature(projectID, featureSlug string) error {
 	var wt string
@@ -453,6 +662,126 @@ func (r *Runner) Verify(projectID, slug, command string) (string, error) {
 	return result + output, nil
 }
 
+// IntegrationEscalation reports that the integration gate could not make the
+// feature branch build and test green within its attempt budget. Detect with errors.As.
+type IntegrationEscalation struct {
+	Feature  string
+	Attempts int
+	Output   string // last build/test output
+}
+
+func (e *IntegrationEscalation) Error() string {
+	return fmt.Sprintf("integration gate could not make feature %q green after %d attempt(s)", e.Feature, e.Attempts)
+}
+
+// detectVerifyCommand returns the auto-detected build/test command for dir. It
+// recognises a Go module (go.mod) and returns (cmd, true); otherwise ("", false).
+func detectVerifyCommand(dir string) (string, bool) {
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+		return "go build ./... && go test ./...", true
+	}
+	return "", false
+}
+
+// runVerify runs command in dir and returns its combined output (truncated to
+// 30000 bytes like Verify) and ok = (the command exited zero).
+func runVerify(dir, command string) (output string, ok bool) {
+	cmd := exec.Command("sh", "-c", command)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	out, runErr := cmd.CombinedOutput()
+	output = string(out)
+	if len(output) > 30000 {
+		origLen := len(output)
+		output = output[:30000] + fmt.Sprintf("\n... [output truncated at 30000 of %d bytes]", origLen)
+	}
+	return output, runErr == nil
+}
+
+// IntegrateFeature ensures the feature's integration worktree builds and tests green.
+// It runs the detected build/test command in the feature worktree; if it fails, it runs
+// up to r.maxResolveAttempts resolve-only autonomous sessions (each instructed to fix
+// ONLY build/test breakage — no new features, no behavior changes), committing each
+// session's changes to the feature branch and re-running the command. Returns nil once
+// green; *IntegrationEscalation when the attempt budget is exhausted; a plain error on
+// infrastructure failure (e.g. missing worktree). Sets Feature.Status = FeatureIntegrating
+// while running and restores it to FeatureRunning on success; leaves status unchanged on
+// escalation (the caller decides how to surface it).
+func (r *Runner) IntegrateFeature(projectID, featureSlug string) error {
+	f, err := r.store.GetFeature(projectID, featureSlug)
+	if err != nil {
+		return err
+	}
+	if f == nil {
+		return fmt.Errorf("no feature %q", featureSlug)
+	}
+	wt := r.featureWorktree(projectID, featureSlug)
+	if _, err := os.Stat(wt); err != nil {
+		return fmt.Errorf("no integration worktree for feature %q (start it first)", featureSlug)
+	}
+
+	f.Status = store.FeatureIntegrating
+	_ = r.store.UpdateFeature(f)
+
+	markRunning := func() error {
+		f.Status = store.FeatureRunning
+		_ = r.store.UpdateFeature(f)
+		return nil
+	}
+
+	cmd, ok := detectVerifyCommand(wt)
+	if !ok {
+		// Nothing to verify — vacuously green.
+		return markRunning()
+	}
+
+	output, green := runVerify(wt, cmd)
+	if green {
+		return markRunning()
+	}
+
+	for attempt := 1; attempt <= r.maxResolveAttempts; attempt++ {
+		resolvePrompt := fmt.Sprintf(`The feature integration branch currently FAILS the command:
+
+    %s
+
+Here is the failing build/test output:
+
+%s
+
+Fix ONLY what is necessary to make `+"`%s`"+` pass. Do NOT add features, change public
+behavior, or touch unrelated files. Keep the change minimal and focused on the breakage.`,
+			cmd, output, cmd)
+
+		spec := worker.Spec{
+			ID:           "feat-" + featureSlug + "-integrate",
+			Prompt:       resolvePrompt,
+			RepoPath:     r.repoPath,
+			Worktree:     wt,
+			Branch:       featureBranch(featureSlug),
+			Reopen:       true,
+			SystemPrompt: WorkerSystemPrompt,
+		}
+		w := worker.New(spec)
+		w.TurnTimeout = r.turnTimeout
+		if err := w.Start(context.Background(), r.selfExe); err != nil {
+			// A failed session is an unproductive attempt, not a hard error.
+			output += fmt.Sprintf("\n\n[resolve attempt %d: session start failed: %v]", attempt, err)
+			continue
+		}
+		_, _ = w.Run(context.Background())
+		_ = w.Commit(fmt.Sprintf("fix(%s): integration gate resolve", featureSlug))
+		_ = w.Close()
+
+		output, green = runVerify(wt, cmd)
+		if green {
+			return markRunning()
+		}
+	}
+
+	return &IntegrationEscalation{Feature: featureSlug, Attempts: r.maxResolveAttempts, Output: output}
+}
+
 // Revise hands a finished task's branch back to a worker with feedback so it
 // can iterate. Reuses a live worker if one exists; otherwise reopens the
 // existing worktree+branch. The resulting turn is committed on success.
@@ -545,6 +874,50 @@ func (r *Runner) OpenPR(projectID, slug, title, body string) (string, error) {
 		return "", fmt.Errorf("gh pr create failed (is gh installed and authenticated, and origin a GitHub remote?): %v: %s", err, string(out))
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// OpenFeaturePR pushes the feature's branch to origin and opens a GitHub PR
+// (feature branch → default base) via gh, titled "feat(<slug>): <feature title>".
+// On success it sets Feature.Status = FeatureDone, persists, and returns gh's output
+// (the PR URL). Mirrors OpenPR's push+gh behavior exactly.
+func (r *Runner) OpenFeaturePR(projectID, featureSlug, body string) (string, error) {
+	f, err := r.store.GetFeature(projectID, featureSlug)
+	if err != nil {
+		return "", err
+	}
+	if f == nil {
+		return "", fmt.Errorf("no feature %q", featureSlug)
+	}
+	if f.Branch == "" {
+		return "", fmt.Errorf("feature %q has no branch yet (start it first)", featureSlug)
+	}
+	title := fmt.Sprintf("feat(%s): %s", featureSlug, f.Title)
+	if body == "" {
+		body = "Automated by rambl."
+	}
+	base := r.defaultBase()
+	if out, err := worker.PushBranch(r.repoPath, "origin", f.Branch); err != nil {
+		return "", fmt.Errorf("git push failed: %v: %s", err, out)
+	}
+	cmd := exec.Command("gh", "pr", "create", "--base", base, "--head", f.Branch, "--title", title, "--body", body)
+	cmd.Dir = r.repoPath
+	cmd.Env = os.Environ()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh pr create failed (is gh installed and authenticated, and origin a GitHub remote?): %v: %s", err, string(out))
+	}
+	f.Status = store.FeatureDone
+	_ = r.store.UpdateFeature(f)
+	return strings.TrimSpace(string(out)), nil
+}
+
+// execOpenFeaturePR opens the feature PR using r.openFeaturePRFn when set (tests),
+// else the real OpenFeaturePR path (production).
+func (r *Runner) execOpenFeaturePR(projectID, featureSlug, body string) (string, error) {
+	if r.openFeaturePRFn != nil {
+		return r.openFeaturePRFn(projectID, featureSlug, body)
+	}
+	return r.OpenFeaturePR(projectID, featureSlug, body)
 }
 
 // defaultBase resolves the PR base branch from origin's HEAD symbolic ref,

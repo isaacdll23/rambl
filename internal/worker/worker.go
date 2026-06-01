@@ -33,6 +33,16 @@ type Spec struct {
 	SystemPrompt string   // appended to the worker's system prompt (autonomy + outcome protocol)
 	Worktree     string   // explicit absolute worktree path; if empty, defaults to <RepoPath>/.rambl/worktrees/<ID>
 	Reopen       bool     // if true, attach to the existing branch+worktree instead of creating them (used to iterate on a task's prior output)
+	Branch       string   // explicit branch name; when "", defaults to "rambl/"+ID
+}
+
+// branchName returns the worktree branch for a spec: an explicit Branch when
+// set, else the default "rambl/"+ID.
+func branchName(spec Spec) string {
+	if spec.Branch != "" {
+		return spec.Branch
+	}
+	return "rambl/" + spec.ID
 }
 
 // Turn is the outcome of one prompt→completion cycle.
@@ -69,7 +79,7 @@ func New(spec Spec) *Worker {
 // Start creates the worktree, wires the Stop-hook socket + settings, starts the
 // transcript tailer, and spawns the autonomous session (ready for Send).
 func (w *Worker) Start(ctx context.Context, selfExe string) error {
-	w.Branch = "rambl/" + w.Spec.ID
+	w.Branch = branchName(w.Spec)
 	if w.Spec.Worktree != "" {
 		w.Worktree = w.Spec.Worktree
 	} else {

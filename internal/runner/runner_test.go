@@ -2,10 +2,12 @@ package runner
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"rambl/internal/store"
@@ -713,12 +715,414 @@ func TestMergeTaskIntoFeatureConflict(t *testing.T) {
 	}
 }
 
+// --- IntegrateFeature -------------------------------------------------------
+
+// startFeature adds a feature and starts its integration worktree, returning the
+// worktree path.
+func (h *harness) startFeature(slug string) string {
+	h.t.Helper()
+	if _, err := h.st.AddFeature(h.projectID, slug, slug+" feature"); err != nil {
+		h.t.Fatalf("AddFeature %q: %v", slug, err)
+	}
+	if _, err := h.r.StartFeature(h.projectID, slug); err != nil {
+		h.t.Fatalf("StartFeature %q: %v", slug, err)
+	}
+	return filepath.Join(h.worktreeBase, h.projectID, "@feat-"+slug)
+}
+
+func TestIntegrateFeatureGreenNoCommand(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	h.startFeature("nocmd") // worktree has only README — no go.mod
+
+	if err := h.r.IntegrateFeature(h.projectID, "nocmd"); err != nil {
+		t.Fatalf("IntegrateFeature: %v", err)
+	}
+	f, err := h.st.GetFeature(h.projectID, "nocmd")
+	if err != nil {
+		t.Fatalf("GetFeature: %v", err)
+	}
+	if f.Status != store.FeatureRunning {
+		t.Errorf("status = %q, want %q", f.Status, store.FeatureRunning)
+	}
+}
+
+func TestIntegrateFeatureGreenPassingBuild(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	wt := h.startFeature("greenbuild")
+
+	if err := os.WriteFile(filepath.Join(wt, "go.mod"), []byte("module gatecheck\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "lib.go"), []byte("package gatecheck\n\nfunc Add(a, b int) int { return a + b }\n"), 0o644); err != nil {
+		t.Fatalf("write lib.go: %v", err)
+	}
+	runGit(t, wt, "add", "-A")
+	runGit(t, wt, "commit", "-m", "add module")
+
+	if err := h.r.IntegrateFeature(h.projectID, "greenbuild"); err != nil {
+		t.Fatalf("IntegrateFeature: %v", err)
+	}
+	f, err := h.st.GetFeature(h.projectID, "greenbuild")
+	if err != nil {
+		t.Fatalf("GetFeature: %v", err)
+	}
+	if f.Status != store.FeatureRunning {
+		t.Errorf("status = %q, want %q", f.Status, store.FeatureRunning)
+	}
+}
+
+func TestIntegrateFeatureEscalation(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	wt := h.startFeature("breakbuild")
+	h.r.maxResolveAttempts = 1
+	// Make the resolve session's Start fail fast (no real Claude binary).
+	t.Setenv("CLAUDE_PATH", filepath.Join(t.TempDir(), "no-claude"))
+
+	if err := os.WriteFile(filepath.Join(wt, "go.mod"), []byte("module gatecheck\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	// A .go file that does not compile.
+	if err := os.WriteFile(filepath.Join(wt, "broken.go"), []byte("package gatecheck\n\nfunc Broken( {\n"), 0o644); err != nil {
+		t.Fatalf("write broken.go: %v", err)
+	}
+	runGit(t, wt, "add", "-A")
+	runGit(t, wt, "commit", "-m", "add broken module")
+
+	err := h.r.IntegrateFeature(h.projectID, "breakbuild")
+	var esc *IntegrationEscalation
+	if !errors.As(err, &esc) {
+		t.Fatalf("expected *IntegrationEscalation, got %v", err)
+	}
+	if esc.Attempts != 1 {
+		t.Errorf("Attempts = %d, want 1", esc.Attempts)
+	}
+	if strings.TrimSpace(esc.Output) == "" {
+		t.Errorf("expected non-empty build-failure output")
+	}
+}
+
+func TestIntegrateFeatureNoWorktree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	if _, err := h.st.AddFeature(h.projectID, "unstarted", "Unstarted feature"); err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	wantErr(t, h.r.IntegrateFeature(h.projectID, "unstarted"), "no integration worktree")
+}
+
 func slugs(tasks []*store.Task) []string {
 	out := make([]string, len(tasks))
 	for i, t := range tasks {
 		out[i] = t.Slug
 	}
 	return out
+}
+
+// --- DAG scheduler ----------------------------------------------------------
+
+// gitRun runs a git subcommand returning an error (safe to call off the test
+// goroutine, unlike runGit which calls t.Fatalf).
+func gitRun(dir string, args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git %s (in %s): %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+	return nil
+}
+
+// fakeRunTask returns a runTask override that drives scheduling without spawning
+// real Claude sessions. For each dispatched slug it records the dispatch order
+// and, unless statuses[slug] overrides it to a non-Done status, creates branch
+// rambl/<slug> off the CURRENT feature branch tip with a unique committed file
+// and marks the task Done. Serialised so concurrent waves don't race the repo.
+func (h *harness) fakeRunTask(featureSlug string, statuses map[string]store.Status, order *[]string) func(string, string) (store.Status, error) {
+	var mu sync.Mutex
+	return func(projectID, slug string) (store.Status, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if order != nil {
+			*order = append(*order, slug)
+		}
+		st := store.Done
+		if s, ok := statuses[slug]; ok {
+			st = s
+		}
+		if st != store.Done {
+			return st, nil
+		}
+		dir, err := os.MkdirTemp("", "rambl-fake-")
+		if err != nil {
+			return store.Failed, err
+		}
+		wt := filepath.Join(dir, slug)
+		if err := gitRun(h.repo, "worktree", "add", "-b", "rambl/"+slug, wt, featureBranch(featureSlug)); err != nil {
+			return store.Failed, err
+		}
+		if err := os.WriteFile(filepath.Join(wt, slug+".txt"), []byte(slug+"\n"), 0o644); err != nil {
+			return store.Failed, err
+		}
+		if err := gitRun(wt, "add", "-A"); err != nil {
+			return store.Failed, err
+		}
+		if err := gitRun(wt, "commit", "-m", "work "+slug); err != nil {
+			return store.Failed, err
+		}
+		_ = gitRun(h.repo, "worktree", "remove", "--force", wt)
+
+		tk, err := h.st.GetTask(projectID, slug)
+		if err != nil {
+			return store.Failed, err
+		}
+		tk.Status = store.Done
+		tk.Branch = "rambl/" + slug
+		if err := h.st.Update(tk); err != nil {
+			return store.Failed, err
+		}
+		return store.Done, nil
+	}
+}
+
+func TestDispatchableFeatureTasks(t *testing.T) {
+	h := newHarness(t)
+	f, err := h.st.AddFeature(h.projectID, "feat", "Feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	for _, tc := range []struct {
+		slug string
+		deps []string
+	}{{"a", nil}, {"b", []string{"a"}}, {"c", []string{"a"}}} {
+		if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, tc.slug, tc.slug+" title", "do "+tc.slug, tc.deps); err != nil {
+			t.Fatalf("AddTaskToFeature %q: %v", tc.slug, err)
+		}
+	}
+
+	ready, err := h.r.DispatchableFeatureTasks(h.projectID, "feat", map[string]bool{})
+	if err != nil {
+		t.Fatalf("DispatchableFeatureTasks: %v", err)
+	}
+	if got := slugs(ready); !equalStrings(got, []string{"a"}) {
+		t.Errorf("merged={} dispatchable = %v, want [a]", got)
+	}
+
+	// Once a is done+merged it drops out, and its dependents b, c become ready.
+	h.mutate("a", func(tk *store.Task) { tk.Status = store.Done })
+	ready, err = h.r.DispatchableFeatureTasks(h.projectID, "feat", map[string]bool{"a": true})
+	if err != nil {
+		t.Fatalf("DispatchableFeatureTasks: %v", err)
+	}
+	if got := slugs(ready); !equalStrings(got, []string{"b", "c"}) {
+		t.Errorf("merged={a} dispatchable = %v, want [b c]", got)
+	}
+
+	// A task already non-Todo is excluded even when its deps are satisfied.
+	h.mutate("b", func(tk *store.Task) { tk.Status = store.Running })
+	ready, err = h.r.DispatchableFeatureTasks(h.projectID, "feat", map[string]bool{"a": true})
+	if err != nil {
+		t.Fatalf("DispatchableFeatureTasks: %v", err)
+	}
+	if got := slugs(ready); !equalStrings(got, []string{"c"}) {
+		t.Errorf("after b->Running, merged={a} dispatchable = %v, want [c]", got)
+	}
+
+	// Unknown feature -> error.
+	_, err = h.r.DispatchableFeatureTasks(h.projectID, "ghost", map[string]bool{})
+	wantErr(t, err, "no feature")
+}
+
+// featureCommitSubjects returns the subjects of the N commits on top of the
+// feature branch's base (newest first).
+func featureCommitSubjects(t *testing.T, h *harness, featureSlug string, n int) []string {
+	t.Helper()
+	out := runGit(t, h.repo, "log", "--format=%s", "-n", fmt.Sprint(n), featureBranch(featureSlug))
+	return strings.Split(strings.TrimSpace(out), "\n")
+}
+
+func TestRunFeatureHappyPath(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	f, err := h.st.AddFeature(h.projectID, "feat", "Feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	for _, slug := range []string{"t1", "t2"} {
+		if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, slug, slug, "do "+slug, nil); err != nil {
+			t.Fatalf("AddTaskToFeature %q: %v", slug, err)
+		}
+	}
+	h.r.runTask = h.fakeRunTask("feat", nil, nil)
+	h.r.openFeaturePRFn = func(_, _, _ string) (string, error) { return "https://example/pr/1", nil }
+
+	if err := h.r.RunFeature(h.projectID, "feat"); err != nil {
+		t.Fatalf("RunFeature: %v", err)
+	}
+
+	// Two merge commits, newest-first: t2 then t1 (merged in ascending slug order).
+	subj := featureCommitSubjects(t, h, "feat", 2)
+	if len(subj) != 2 {
+		t.Fatalf("expected 2 commits, got %d: %v", len(subj), subj)
+	}
+	if !strings.HasPrefix(subj[1], "feat(t1):") {
+		t.Errorf("oldest commit = %q, want feat(t1): prefix", subj[1])
+	}
+	if !strings.HasPrefix(subj[0], "feat(t2):") {
+		t.Errorf("newest commit = %q, want feat(t2): prefix", subj[0])
+	}
+}
+
+func TestRunFeatureDependencyOrder(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	f, err := h.st.AddFeature(h.projectID, "feat", "Feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "base", "base", "do base", nil); err != nil {
+		t.Fatalf("AddTaskToFeature base: %v", err)
+	}
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "dependent", "dependent", "do dependent", []string{"base"}); err != nil {
+		t.Fatalf("AddTaskToFeature dependent: %v", err)
+	}
+	var order []string
+	h.r.runTask = h.fakeRunTask("feat", nil, &order)
+	h.r.openFeaturePRFn = func(_, _, _ string) (string, error) { return "https://example/pr/1", nil }
+
+	if err := h.r.RunFeature(h.projectID, "feat"); err != nil {
+		t.Fatalf("RunFeature: %v", err)
+	}
+
+	if !equalStrings(order, []string{"base", "dependent"}) {
+		t.Errorf("dispatch order = %v, want [base dependent]", order)
+	}
+	subj := featureCommitSubjects(t, h, "feat", 2)
+	if len(subj) != 2 || !strings.HasPrefix(subj[1], "feat(base):") || !strings.HasPrefix(subj[0], "feat(dependent):") {
+		t.Errorf("commit subjects = %v, want [feat(dependent):..., feat(base):...]", subj)
+	}
+}
+
+func TestRunFeatureTaskFailure(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	f, err := h.st.AddFeature(h.projectID, "feat", "Feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "good", "good", "do good", nil); err != nil {
+		t.Fatalf("AddTaskToFeature good: %v", err)
+	}
+	if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, "bad", "bad", "do bad", nil); err != nil {
+		t.Fatalf("AddTaskToFeature bad: %v", err)
+	}
+	h.r.runTask = h.fakeRunTask("feat", map[string]store.Status{"bad": store.Failed}, nil)
+
+	err = h.r.RunFeature(h.projectID, "feat")
+	wantErr(t, err, "did not complete")
+	wantErr(t, err, "bad")
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// --- OpenFeaturePR + auto-open ----------------------------------------------
+
+// TestOpenFeaturePRPushFails exercises the push-failure branch: a started feature
+// has a branch, but the harness repo has no "origin" remote, so PushBranch fails
+// before any gh call.
+func TestOpenFeaturePRPushFails(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	if _, err := h.st.AddFeature(h.projectID, "auth", "Auth feature"); err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	if _, err := h.r.StartFeature(h.projectID, "auth"); err != nil {
+		t.Fatalf("StartFeature: %v", err)
+	}
+
+	_, err := h.r.OpenFeaturePR(h.projectID, "auth", "")
+	wantErr(t, err, "git push")
+}
+
+// TestOpenFeaturePRNoBranch: a feature that was never started has no branch, so
+// OpenFeaturePR returns before any push/gh call.
+func TestOpenFeaturePRNoBranch(t *testing.T) {
+	h := newHarness(t)
+	if _, err := h.st.AddFeature(h.projectID, "auth", "Auth feature"); err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	_, err := h.r.OpenFeaturePR(h.projectID, "auth", "")
+	wantErr(t, err, "no branch")
+}
+
+// TestRunFeatureAutoOpensPR asserts RunFeature auto-opens the feature PR exactly
+// once, with the right slug, after all tasks merge green. The openFeaturePRFn seam
+// avoids a real push/gh call.
+func TestRunFeatureAutoOpensPR(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	f, err := h.st.AddFeature(h.projectID, "feat", "Feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	for _, slug := range []string{"t1", "t2"} {
+		if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, slug, slug, "do "+slug, nil); err != nil {
+			t.Fatalf("AddTaskToFeature %q: %v", slug, err)
+		}
+	}
+	h.r.runTask = h.fakeRunTask("feat", nil, nil)
+
+	var mu sync.Mutex
+	var calls []string
+	h.r.openFeaturePRFn = func(_, featureSlug, _ string) (string, error) {
+		mu.Lock()
+		calls = append(calls, featureSlug)
+		mu.Unlock()
+		return "https://example/pr/1", nil
+	}
+
+	if err := h.r.RunFeature(h.projectID, "feat"); err != nil {
+		t.Fatalf("RunFeature: %v", err)
+	}
+
+	if !equalStrings(calls, []string{"feat"}) {
+		t.Fatalf("openFeaturePRFn calls = %v, want [feat]", calls)
+	}
+
+	// The feature branch carries the merged feat(...) commits.
+	subj := featureCommitSubjects(t, h, "feat", 2)
+	if len(subj) != 2 || !strings.HasPrefix(subj[1], "feat(t1):") || !strings.HasPrefix(subj[0], "feat(t2):") {
+		t.Errorf("commit subjects = %v, want [feat(t2):..., feat(t1):...]", subj)
+	}
 }
 
 func TestTopoOrder(t *testing.T) {
