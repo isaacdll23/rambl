@@ -310,8 +310,36 @@ func TestPMEventsLogged(t *testing.T) {
 	})
 	// read-only tool: must NOT log.
 	mustCall(t, cli, ctx, "list_tasks", nil)
+	// Point the worker's session launch at a binary that doesn't exist so it
+	// fails fast and deterministically, regardless of whether a real `claude`
+	// binary is installed on the host. Without this, on a dev machine that has
+	// `claude` on PATH the worker would actually start a session and run for the
+	// full turn timeout instead of settling quickly. On failure the worker rolls
+	// back its worktree (removing the .git/worktrees entry), which is exactly the
+	// cleanup we need before t.TempDir() runs.
+	t.Setenv("CLAUDE_PATH", filepath.Join(t.TempDir(), "no-such-claude-binary"))
+
 	// dispatch a todo task with no deps; handler logs before the worker goroutine.
 	mustCall(t, cli, ctx, "dispatch", map[string]any{"slug": "core"})
+
+	// dispatch spawns a background worker goroutine that runs `git worktree add`
+	// against the temp repo; with selfExe="" it fails fast. Wait for it to settle
+	// before the test returns so t.TempDir() cleanup doesn't race the goroutine's
+	// writes under .git (which caused a flaky "directory not empty" under -race).
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		tk, err := st.GetTask(proj, "core")
+		if err != nil {
+			t.Fatalf("get task: %v", err)
+		}
+		if tk != nil && tk.Status != store.Running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dispatched worker did not settle (still running)")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	events, err := st.RecentEvents(proj, 50)
 	if err != nil {
