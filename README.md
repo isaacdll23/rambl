@@ -36,9 +36,30 @@ low-level mechanics.
 - The `claude` CLI installed and logged in (`claude` → `/login`) with a Pro/Max plan
 - git
 
-## Build
+## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/isaacdll23/rambl/main/install.sh | sh
+```
+
+The script detects your platform, downloads the matching binary from the latest
+[release](https://github.com/isaacdll23/rambl/releases), verifies its checksum,
+and installs to `/usr/local/bin`. Override the target with `BINDIR=…` or pin a
+version with `VERSION=v0.1.0`. Linux and macOS, amd64/arm64.
+
+Prefer to do it by hand? Grab an archive from the
+[releases page](https://github.com/isaacdll23/rambl/releases):
+
+```sh
+tar -xzf rambl_0.1.0_darwin_arm64.tar.gz   # pick your os/arch
+sudo mv rambl /usr/local/bin/
+rambl version
+```
+
+Or build from source (Go 1.26+; clone first — the module path isn't go-installable):
+
+```sh
+git clone https://github.com/isaacdll23/rambl && cd rambl
 go build -o rambl ./cmd/rambl
 ```
 
