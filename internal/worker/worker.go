@@ -290,6 +290,63 @@ func AddFeatureWorktree(repoPath, worktreePath, featureBranch, base string) erro
 	return nil
 }
 
+// SquashMerge squashes taskBranch into the branch checked out in featureWorktree,
+// producing exactly one commit with the given message. It runs, in featureWorktree:
+//
+//	git merge --squash <taskBranch>
+//
+// then commits via the gitID identity helper. Behavior:
+//   - On conflict: abort cleanly (git merge --abort / reset --hard so the worktree
+//     is left clean with no merge in progress) and return (true, err) naming the
+//     conflicted files.
+//   - When the squash stages no changes (task added nothing): return (false, nil)
+//     WITHOUT creating an empty commit.
+//   - Otherwise commit and return (false, nil).
+func SquashMerge(featureWorktree, taskBranch, message string) (conflict bool, err error) {
+	gitMu.Lock()
+	defer gitMu.Unlock()
+
+	if out, mergeErr := gitID(featureWorktree, "merge", "--squash", taskBranch); mergeErr != nil {
+		// Capture conflicted paths before cleaning the worktree.
+		files, _ := ConflictedFiles(featureWorktree)
+		// `git merge --squash` records no MERGE_HEAD, so `git merge --abort` is a
+		// best-effort no-op; `git reset --hard` reliably clears the staged squash
+		// and any conflict markers, leaving the worktree clean.
+		_, _ = gitID(featureWorktree, "merge", "--abort")
+		_, _ = gitID(featureWorktree, "reset", "--hard", "HEAD")
+		if len(files) > 0 {
+			return true, fmt.Errorf("squash merge of %s conflicted in: %s", taskBranch, strings.Join(files, ", "))
+		}
+		return false, fmt.Errorf("git merge --squash %s: %v: %s", taskBranch, mergeErr, out)
+	}
+
+	// A squash that staged nothing (the task added no changes vs the feature tip)
+	// must not produce an empty commit.
+	if _, err := gitID(featureWorktree, "diff", "--cached", "--quiet"); err == nil {
+		return false, nil
+	}
+
+	if out, err := gitID(featureWorktree, "commit", "-m", message); err != nil {
+		return false, fmt.Errorf("commit: %v: %s", err, out)
+	}
+	return false, nil
+}
+
+// ConflictedFiles returns unmerged paths in worktree (git diff --name-only --diff-filter=U).
+func ConflictedFiles(worktree string) ([]string, error) {
+	out, err := git(worktree, "diff", "--name-only", "--diff-filter=U")
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, line := range strings.Split(out, "\n") {
+		if p := strings.TrimSpace(line); p != "" {
+			files = append(files, p)
+		}
+	}
+	return files, nil
+}
+
 // BranchExists reports whether branch exists in repoPath.
 func BranchExists(repoPath, branch string) bool {
 	_, err := git(repoPath, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)

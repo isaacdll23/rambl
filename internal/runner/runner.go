@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -200,6 +201,126 @@ func (r *Runner) StartFeature(projectID, featureSlug string) (*store.Feature, er
 		return nil, err
 	}
 	return f, nil
+}
+
+// MergeConflictError reports that a task branch could not be cleanly squash-merged
+// into its feature branch. Detect with errors.As.
+type MergeConflictError struct {
+	Feature string
+	Task    string
+	Files   []string
+}
+
+func (e *MergeConflictError) Error() string {
+	return fmt.Sprintf("merge of task %q into feature %q conflicted in: %s",
+		e.Task, e.Feature, strings.Join(e.Files, ", "))
+}
+
+// MergeTaskIntoFeature squash-merges rambl/<taskSlug> into the feature branch as one
+// commit "feat(<taskSlug>): <task title>", run inside the feature integration worktree.
+// Returns *MergeConflictError on conflict.
+func (r *Runner) MergeTaskIntoFeature(projectID, featureSlug, taskSlug string) error {
+	f, err := r.store.GetFeature(projectID, featureSlug)
+	if err != nil {
+		return err
+	}
+	if f == nil {
+		return fmt.Errorf("no feature %q", featureSlug)
+	}
+	t, err := r.store.GetTask(projectID, taskSlug)
+	if err != nil {
+		return err
+	}
+	if t == nil {
+		return fmt.Errorf("no task %q", taskSlug)
+	}
+
+	featureWorktree := r.featureWorktree(projectID, featureSlug)
+	message := fmt.Sprintf("feat(%s): %s", taskSlug, t.Title)
+	conflict, err := worker.SquashMerge(featureWorktree, "rambl/"+taskSlug, message)
+	if conflict {
+		// SquashMerge already aborted and cleaned the worktree, so the unmerged
+		// paths are no longer queryable; recover them from the error it named.
+		return &MergeConflictError{Feature: featureSlug, Task: taskSlug, Files: conflictedFilesFromErr(err)}
+	}
+	return err
+}
+
+// conflictedFilesFromErr extracts the comma-separated paths SquashMerge names in
+// its conflict error ("... conflicted in: a, b"). Returns nil if absent.
+func conflictedFilesFromErr(err error) []string {
+	if err == nil {
+		return nil
+	}
+	const marker = "conflicted in: "
+	i := strings.Index(err.Error(), marker)
+	if i < 0 {
+		return nil
+	}
+	var files []string
+	for _, p := range strings.Split(err.Error()[i+len(marker):], ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			files = append(files, p)
+		}
+	}
+	return files
+}
+
+// TopoOrder returns tasks in a deterministic dependency order (Kahn's algorithm over
+// Task.Deps that reference slugs WITHIN the given set; deps to slugs not in the set are
+// ignored). Ties among ready nodes break by ascending slug. Errors on a dependency cycle.
+func TopoOrder(tasks []*store.Task) ([]*store.Task, error) {
+	bySlug := make(map[string]*store.Task, len(tasks))
+	for _, t := range tasks {
+		bySlug[t.Slug] = t
+	}
+
+	// indegree counts only deps that reference slugs within the set; dependents
+	// maps an upstream slug to the downstream slugs that depend on it.
+	indegree := make(map[string]int, len(tasks))
+	dependents := make(map[string][]string, len(tasks))
+	for _, t := range tasks {
+		for _, dep := range t.Deps {
+			if _, ok := bySlug[dep]; !ok {
+				continue // dep outside the set is ignored
+			}
+			indegree[t.Slug]++
+			dependents[dep] = append(dependents[dep], t.Slug)
+		}
+	}
+
+	// Seed the ready set with every zero-indegree node, kept sorted by slug.
+	var ready []string
+	for _, t := range tasks {
+		if indegree[t.Slug] == 0 {
+			ready = append(ready, t.Slug)
+		}
+	}
+	sort.Strings(ready)
+
+	ordered := make([]*store.Task, 0, len(tasks))
+	for len(ready) > 0 {
+		slug := ready[0]
+		ready = ready[1:]
+		ordered = append(ordered, bySlug[slug])
+
+		var freed []string
+		for _, down := range dependents[slug] {
+			indegree[down]--
+			if indegree[down] == 0 {
+				freed = append(freed, down)
+			}
+		}
+		if len(freed) > 0 {
+			ready = append(ready, freed...)
+			sort.Strings(ready)
+		}
+	}
+
+	if len(ordered) != len(tasks) {
+		return nil, fmt.Errorf("dependency cycle among tasks")
+	}
+	return ordered, nil
 }
 
 // CleanupFeature best-effort removes the feature's integration worktree and branch.
