@@ -965,6 +965,7 @@ func TestRunFeatureHappyPath(t *testing.T) {
 		}
 	}
 	h.r.runTask = h.fakeRunTask("feat", nil, nil)
+	h.r.openFeaturePRFn = func(_, _, _ string) (string, error) { return "https://example/pr/1", nil }
 
 	if err := h.r.RunFeature(h.projectID, "feat"); err != nil {
 		t.Fatalf("RunFeature: %v", err)
@@ -1000,6 +1001,7 @@ func TestRunFeatureDependencyOrder(t *testing.T) {
 	}
 	var order []string
 	h.r.runTask = h.fakeRunTask("feat", nil, &order)
+	h.r.openFeaturePRFn = func(_, _, _ string) (string, error) { return "https://example/pr/1", nil }
 
 	if err := h.r.RunFeature(h.projectID, "feat"); err != nil {
 		t.Fatalf("RunFeature: %v", err)
@@ -1046,6 +1048,81 @@ func equalStrings(got, want []string) bool {
 		}
 	}
 	return true
+}
+
+// --- OpenFeaturePR + auto-open ----------------------------------------------
+
+// TestOpenFeaturePRPushFails exercises the push-failure branch: a started feature
+// has a branch, but the harness repo has no "origin" remote, so PushBranch fails
+// before any gh call.
+func TestOpenFeaturePRPushFails(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	if _, err := h.st.AddFeature(h.projectID, "auth", "Auth feature"); err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	if _, err := h.r.StartFeature(h.projectID, "auth"); err != nil {
+		t.Fatalf("StartFeature: %v", err)
+	}
+
+	_, err := h.r.OpenFeaturePR(h.projectID, "auth", "")
+	wantErr(t, err, "git push")
+}
+
+// TestOpenFeaturePRNoBranch: a feature that was never started has no branch, so
+// OpenFeaturePR returns before any push/gh call.
+func TestOpenFeaturePRNoBranch(t *testing.T) {
+	h := newHarness(t)
+	if _, err := h.st.AddFeature(h.projectID, "auth", "Auth feature"); err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	_, err := h.r.OpenFeaturePR(h.projectID, "auth", "")
+	wantErr(t, err, "no branch")
+}
+
+// TestRunFeatureAutoOpensPR asserts RunFeature auto-opens the feature PR exactly
+// once, with the right slug, after all tasks merge green. The openFeaturePRFn seam
+// avoids a real push/gh call.
+func TestRunFeatureAutoOpensPR(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+	f, err := h.st.AddFeature(h.projectID, "feat", "Feature")
+	if err != nil {
+		t.Fatalf("AddFeature: %v", err)
+	}
+	for _, slug := range []string{"t1", "t2"} {
+		if _, err := h.st.AddTaskToFeature(h.projectID, f.ID, slug, slug, "do "+slug, nil); err != nil {
+			t.Fatalf("AddTaskToFeature %q: %v", slug, err)
+		}
+	}
+	h.r.runTask = h.fakeRunTask("feat", nil, nil)
+
+	var mu sync.Mutex
+	var calls []string
+	h.r.openFeaturePRFn = func(_, featureSlug, _ string) (string, error) {
+		mu.Lock()
+		calls = append(calls, featureSlug)
+		mu.Unlock()
+		return "https://example/pr/1", nil
+	}
+
+	if err := h.r.RunFeature(h.projectID, "feat"); err != nil {
+		t.Fatalf("RunFeature: %v", err)
+	}
+
+	if !equalStrings(calls, []string{"feat"}) {
+		t.Fatalf("openFeaturePRFn calls = %v, want [feat]", calls)
+	}
+
+	// The feature branch carries the merged feat(...) commits.
+	subj := featureCommitSubjects(t, h, "feat", 2)
+	if len(subj) != 2 || !strings.HasPrefix(subj[1], "feat(t1):") || !strings.HasPrefix(subj[0], "feat(t2):") {
+		t.Errorf("commit subjects = %v, want [feat(t2):..., feat(t1):...]", subj)
+	}
 }
 
 func TestTopoOrder(t *testing.T) {

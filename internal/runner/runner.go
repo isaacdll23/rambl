@@ -53,6 +53,10 @@ type Runner struct {
 	// nil in production (falls back to dispatchAndWait); overridden in tests to
 	// drive scheduling without spawning real Claude sessions.
 	runTask func(projectID, slug string) (store.Status, error)
+	// openFeaturePRFn opens the feature's PR once it is merged and green. nil in
+	// production (falls back to OpenFeaturePR); overridden in tests to assert the
+	// auto-PR step fires without a real push/gh call.
+	openFeaturePRFn func(projectID, featureSlug, body string) (string, error)
 
 	mu      sync.Mutex
 	workers map[string]*worker.Worker // keyed by task slug
@@ -516,6 +520,15 @@ func (r *Runner) RunFeature(projectID, featureSlug string) error {
 			return fmt.Errorf("feature %q stalled: no dispatchable or mergeable tasks", featureSlug)
 		}
 	}
+
+	// All tasks merged: run a final integration gate so we never open a PR on a
+	// red branch, then auto-open the feature PR.
+	if err := r.IntegrateFeature(projectID, featureSlug); err != nil {
+		return err
+	}
+	if _, err := r.execOpenFeaturePR(projectID, featureSlug, ""); err != nil {
+		return fmt.Errorf("feature %q merged and green but opening PR failed: %w", featureSlug, err)
+	}
 	return nil
 }
 
@@ -861,6 +874,50 @@ func (r *Runner) OpenPR(projectID, slug, title, body string) (string, error) {
 		return "", fmt.Errorf("gh pr create failed (is gh installed and authenticated, and origin a GitHub remote?): %v: %s", err, string(out))
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// OpenFeaturePR pushes the feature's branch to origin and opens a GitHub PR
+// (feature branch → default base) via gh, titled "feat(<slug>): <feature title>".
+// On success it sets Feature.Status = FeatureDone, persists, and returns gh's output
+// (the PR URL). Mirrors OpenPR's push+gh behavior exactly.
+func (r *Runner) OpenFeaturePR(projectID, featureSlug, body string) (string, error) {
+	f, err := r.store.GetFeature(projectID, featureSlug)
+	if err != nil {
+		return "", err
+	}
+	if f == nil {
+		return "", fmt.Errorf("no feature %q", featureSlug)
+	}
+	if f.Branch == "" {
+		return "", fmt.Errorf("feature %q has no branch yet (start it first)", featureSlug)
+	}
+	title := fmt.Sprintf("feat(%s): %s", featureSlug, f.Title)
+	if body == "" {
+		body = "Automated by rambl."
+	}
+	base := r.defaultBase()
+	if out, err := worker.PushBranch(r.repoPath, "origin", f.Branch); err != nil {
+		return "", fmt.Errorf("git push failed: %v: %s", err, out)
+	}
+	cmd := exec.Command("gh", "pr", "create", "--base", base, "--head", f.Branch, "--title", title, "--body", body)
+	cmd.Dir = r.repoPath
+	cmd.Env = os.Environ()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh pr create failed (is gh installed and authenticated, and origin a GitHub remote?): %v: %s", err, string(out))
+	}
+	f.Status = store.FeatureDone
+	_ = r.store.UpdateFeature(f)
+	return strings.TrimSpace(string(out)), nil
+}
+
+// execOpenFeaturePR opens the feature PR using r.openFeaturePRFn when set (tests),
+// else the real OpenFeaturePR path (production).
+func (r *Runner) execOpenFeaturePR(projectID, featureSlug, body string) (string, error) {
+	if r.openFeaturePRFn != nil {
+		return r.openFeaturePRFn(projectID, featureSlug, body)
+	}
+	return r.OpenFeaturePR(projectID, featureSlug, body)
 }
 
 // defaultBase resolves the PR base branch from origin's HEAD symbolic ref,
