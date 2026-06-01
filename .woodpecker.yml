@@ -1,0 +1,23 @@
+steps:
+  test:
+    image: golang:1.26.3
+    environment:
+      GOTOOLCHAIN: go1.26.3
+    commands:
+      - go vet ./...
+      - go test -race ./...
+      - go build ./cmd/rambl
+    when:
+      - event: push
+
+  release:
+    image: ghcr.io/goreleaser/goreleaser:v2.15.4
+    environment:
+      GITHUB_TOKEN:
+        from_secret: github_token
+      GOTOOLCHAIN: go1.26.3
+    commands:
+      - goreleaser release --clean --parallelism 1
+    when:
+      - event: tag
+        ref: refs/tags/v*

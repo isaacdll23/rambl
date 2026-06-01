@@ -4,6 +4,7 @@
 //	rambl pm         explicit environment launch (with flags)
 //	rambl monitor    read-only worker dashboard (--once for a snapshot)
 //	rambl env-once   drive the PM through one brief, non-interactively (verification)
+//	rambl version    print version, commit, and build date
 //
 // Plus the hidden `__hook` subcommand, invoked by each worker's Stop hook.
 package main
@@ -18,6 +19,14 @@ import (
 	"rambl/internal/environment"
 	"rambl/internal/hook"
 	"rambl/internal/monitor"
+)
+
+// Build metadata, injected via -ldflags by goreleaser at release time.
+// Defaults apply to plain `go build`/`go run`.
+var (
+	Version   = "dev"
+	Commit    = "none"
+	BuildDate = "unknown"
 )
 
 func main() {
@@ -42,6 +51,8 @@ func main() {
 		monitorCmd(os.Args[2:])
 	case "env-once":
 		envOnceCmd(os.Args[2:])
+	case "version", "-v", "--version":
+		fmt.Printf("rambl %s (commit %s, built %s)\n", Version, Commit, BuildDate)
 	default:
 		usage()
 	}
@@ -52,7 +63,8 @@ func usage() {
   rambl              launch the PM environment in the current directory
   rambl pm        -repo <path> [-model <m>]
   rambl monitor   -repo <path> [--once]     (read-only dashboard)
-  rambl env-once  -repo <path> -brief <text>  (non-interactive verification)`)
+  rambl env-once  -repo <path> -brief <text>  (non-interactive verification)
+  rambl version                             (print version info)`)
 	os.Exit(2)
 }
 

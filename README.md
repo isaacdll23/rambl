@@ -38,6 +38,19 @@ low-level mechanics.
 
 ## Install
 
+Prebuilt binaries for Linux and macOS (amd64/arm64) are published on every
+tagged release. Download the archive for your platform from the
+[releases page](https://github.com/isaacdll23/rambl/releases), extract it, and
+put `rambl` on your `PATH`:
+
+```sh
+tar -xzf rambl_*_$(uname -s)_$(uname -m).tar.gz
+sudo mv rambl /usr/local/bin/
+rambl version
+```
+
+Or build from source:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/isaacdll23/rambl/main/install.sh | sh
 ```
@@ -88,12 +101,30 @@ git diff main..rambl/<task>
 | `rambl pm -repo <path> [-model <m>]` | explicit environment launch |
 | `rambl monitor -repo <path> [--once]` | read-only worker dashboard |
 | `rambl env-once -repo <path> -brief <text>` | drive the PM through one brief (non-interactive) |
+| `rambl version` | print version, commit, and build date |
 
 ### Tailoring the PM
 
 Drop a `.rambl/pm.md` in your repo; its contents are appended to the PM's
 system prompt. The PM also honors your repo's `CLAUDE.md`, settings, and
 configured MCP servers, since it's an ordinary Claude Code session.
+
+## Releasing
+
+Releases are cut by [Woodpecker CI](.woodpecker.yml): every push runs
+`go vet` / `go test -race` / `go build`, and pushing a `v*` tag triggers
+[GoReleaser](.goreleaser.yaml), which cross-compiles the linux/darwin ×
+amd64/arm64 binaries, archives them with checksums, and publishes a GitHub
+release. The version, commit, and build date are stamped into the binary via
+`-ldflags` and surfaced by `rambl version`.
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0   # Woodpecker builds and publishes the release
+```
+
+CI needs a `github_token` secret (a GitHub token with `repo` scope) configured on
+the Woodpecker repo.
 
 ## Notes & limits
 
