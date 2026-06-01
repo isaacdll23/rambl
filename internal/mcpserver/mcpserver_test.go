@@ -255,6 +255,109 @@ func TestPMReviewToolsOverHTTP(t *testing.T) {
 	}
 }
 
+// TestPMEventsLogged drives the mutating tools that don't require a live worker
+// to *finish* (create_task, dispatch) over the real HTTP transport and asserts
+// that each appends exactly one activity event with the expected kind/slug/summary.
+// dispatch logs synchronously before its worker goroutine, so a failing worker
+// (selfExe "") doesn't affect the recorded event. read-only list_tasks logs none.
+func TestPMEventsLogged(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init")
+	runGit(t, repo, "config", "user.email", "rambl@test")
+	runGit(t, repo, "config", "user.name", "rambl")
+	if err := writeFile(t, filepath.Join(repo, "README.md"), "init\n"); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "init")
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	proj, err := st.EnsureProject(repo, "test")
+	if err != nil {
+		t.Fatalf("project: %v", err)
+	}
+	rn := runner.New(st, repo, "HEAD", "", t.TempDir())
+	srv := New(st, rn, proj)
+
+	httpSrv := server.NewTestStreamableHTTPServer(srv.mcp)
+	defer httpSrv.Close()
+
+	ctx := context.Background()
+	cli, err := mcpclient.NewStreamableHttpClient(httpSrv.URL)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	if err := cli.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if _, err := cli.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: "test", Version: "1.0.0"},
+		},
+	}); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+
+	mustCall(t, cli, ctx, "create_task", map[string]any{
+		"slug": "core", "title": "Core", "prompt": "build core",
+	})
+	mustCall(t, cli, ctx, "create_task", map[string]any{
+		"slug": "cli", "title": "CLI", "prompt": "build cli", "deps": []string{"core"},
+	})
+	// read-only tool: must NOT log.
+	mustCall(t, cli, ctx, "list_tasks", nil)
+	// dispatch a todo task with no deps; handler logs before the worker goroutine.
+	mustCall(t, cli, ctx, "dispatch", map[string]any{"slug": "core"})
+
+	events, err := st.RecentEvents(proj, 50)
+	if err != nil {
+		t.Fatalf("recent events: %v", err)
+	}
+	// Newest first: dispatch core, create cli (deps), create core.
+	type ev struct{ kind, slug, summary string }
+	got := make([]ev, 0, len(events))
+	for _, e := range events {
+		got = append(got, ev{e.Kind, e.Slug, e.Summary})
+	}
+	want := []ev{
+		{"dispatch", "core", "dispatched core"},
+		{"create", "cli", "created cli (deps: core)"},
+		{"create", "core", "created core"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d events, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("event[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestCreateSummary covers the only per-tool summary with branching: the deps
+// suffix appears only for non-empty deps.
+func TestCreateSummary(t *testing.T) {
+	cases := []struct {
+		slug string
+		deps []string
+		want string
+	}{
+		{"core", nil, "created core"},
+		{"core", []string{}, "created core"},
+		{"cli", []string{"core"}, "created cli (deps: core)"},
+		{"app", []string{"core", "cli"}, "created app (deps: core,cli)"},
+	}
+	for _, c := range cases {
+		if got := createSummary(c.slug, c.deps); got != c.want {
+			t.Errorf("createSummary(%q, %v) = %q, want %q", c.slug, c.deps, got, c.want)
+		}
+	}
+}
+
 func mustCall(t *testing.T, cli *mcpclient.Client, ctx context.Context, name string, args map[string]any) *mcp.CallToolResult {
 	t.Helper()
 	req := mcp.CallToolRequest{}

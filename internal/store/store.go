@@ -102,6 +102,15 @@ CREATE TABLE IF NOT EXISTS task_deps (
   depends_on TEXT NOT NULL,
   PRIMARY KEY (project_id, task_slug, depends_on)
 );
+CREATE TABLE IF NOT EXISTS events (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  slug       TEXT NOT NULL DEFAULT '',
+  summary    TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id);
 `
 
 func (s *Store) migrate() error {
@@ -282,6 +291,49 @@ func (s *Store) DeleteTask(projectID, slug string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// Event is one PM-activity entry (a record of a PM tool action).
+type Event struct {
+	ID        int64
+	ProjectID string
+	Kind      string    // short verb: "create" | "dispatch" | "send" | "delete" | "verify" | "revise" | "open_pr"
+	Slug      string    // task slug involved; may be ""
+	Summary   string    // human one-liner, e.g. "dispatched api-routes"
+	CreatedAt time.Time
+}
+
+// AppendEvent inserts one PM-activity event, stamping CreatedAt with the current time.
+func (s *Store) AppendEvent(projectID, kind, slug, summary string) error {
+	_, err := s.db.Exec(`INSERT INTO events (project_id, kind, slug, summary, created_at)
+		VALUES (?, ?, ?, ?, ?)`,
+		projectID, kind, slug, summary, now())
+	return err
+}
+
+// RecentEvents returns up to limit most-recent events for the project, NEWEST FIRST
+// (ORDER BY id DESC LIMIT ?). Returns an empty slice (not nil error) when there are none.
+func (s *Store) RecentEvents(projectID string, limit int) ([]*Event, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`SELECT id, project_id, kind, slug, summary, created_at
+		FROM events WHERE project_id=? ORDER BY id DESC LIMIT ?`, projectID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Event{}
+	for rows.Next() {
+		e := &Event{}
+		var created string
+		if err := rows.Scan(&e.ID, &e.ProjectID, &e.Kind, &e.Slug, &e.Summary, &created); err != nil {
+			return nil, err
+		}
+		e.CreatedAt, _ = time.Parse(time.RFC3339, created)
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) depsOf(projectID, slug string) ([]string, error) {

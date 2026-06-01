@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -19,6 +20,21 @@ import (
 
 // maxWaitSeconds caps how long worker_status will block server-side.
 const maxWaitSeconds = 90
+
+// logEvent records a PM activity event; best-effort, so a store failure never
+// changes the tool call's result or error. Called only on handler success paths.
+func logEvent(st *store.Store, projectID, kind, slug, summary string) {
+	_ = st.AppendEvent(projectID, kind, slug, summary)
+}
+
+// createSummary builds the create_task event summary, appending a deps suffix
+// only when the task has prerequisites.
+func createSummary(slug string, deps []string) string {
+	if len(deps) == 0 {
+		return fmt.Sprintf("created %s", slug)
+	}
+	return fmt.Sprintf("created %s (deps: %s)", slug, strings.Join(deps, ","))
+}
 
 // Server wraps the MCP server for one project.
 type Server struct {
@@ -49,6 +65,7 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 		if _, err := st.AddTask(projectID, slug, title, prompt, deps); err != nil {
 			return mcp.NewToolResultErrorf("create_task: %v", err), nil
 		}
+		logEvent(st, projectID, "create", slug, createSummary(slug, deps))
 		return mcp.NewToolResultText(fmt.Sprintf("created task %q (deps %v)", slug, deps)), nil
 	})
 
@@ -69,6 +86,7 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 		if err := rn.Dispatch(projectID, slug); err != nil {
 			return mcp.NewToolResultErrorf("dispatch: %v", err), nil
 		}
+		logEvent(st, projectID, "dispatch", slug, fmt.Sprintf("dispatched %s", slug))
 		return mcp.NewToolResultText(fmt.Sprintf("dispatched %q; poll worker_status", slug)), nil
 	})
 
@@ -101,6 +119,7 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 		if err := rn.Send(projectID, slug, message); err != nil {
 			return mcp.NewToolResultErrorf("worker_send: %v", err), nil
 		}
+		logEvent(st, projectID, "send", slug, fmt.Sprintf("sent input to %s", slug))
 		return mcp.NewToolResultText(fmt.Sprintf("sent to %q; poll worker_status", slug)), nil
 	})
 
@@ -115,6 +134,7 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 		if err := rn.Delete(projectID, slug); err != nil {
 			return mcp.NewToolResultErrorf("delete_task: %v", err), nil
 		}
+		logEvent(st, projectID, "delete", slug, fmt.Sprintf("deleted %s", slug))
 		return mcp.NewToolResultText(fmt.Sprintf("deleted task %q (worktree and branch reclaimed)", slug)), nil
 	})
 
@@ -147,6 +167,7 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 		if err != nil {
 			return mcp.NewToolResultErrorf("verify_task: %v", err), nil
 		}
+		logEvent(st, projectID, "verify", slug, fmt.Sprintf("verified %s", slug))
 		return mcp.NewToolResultText(out), nil
 	})
 
@@ -166,6 +187,7 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 		if err := rn.Revise(projectID, slug, message); err != nil {
 			return mcp.NewToolResultErrorf("revise_task: %v", err), nil
 		}
+		logEvent(st, projectID, "revise", slug, fmt.Sprintf("revised %s", slug))
 		return mcp.NewToolResultText(fmt.Sprintf("revising %q; poll worker_status", slug)), nil
 	})
 
@@ -185,6 +207,7 @@ func New(st *store.Store, rn *runner.Runner, projectID string) *Server {
 		if err != nil {
 			return mcp.NewToolResultErrorf("open_pr: %v", err), nil
 		}
+		logEvent(st, projectID, "open_pr", slug, fmt.Sprintf("opened PR for %s", slug))
 		return mcp.NewToolResultText(fmt.Sprintf("opened PR for %q: %s", slug, url)), nil
 	})
 
