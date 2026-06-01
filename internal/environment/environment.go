@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"rambl/internal/config"
 	"rambl/internal/mcpserver"
 	"rambl/internal/runner"
 	"rambl/internal/session"
@@ -79,6 +80,9 @@ func prepare(opts Options) (*setup, error) {
 	}
 
 	rn := runner.New(st, repo, opts.Base, self, worktreeBase)
+	if cfg, err := config.Load(); err == nil {
+		rn.SetTurnTimeout(cfg.TurnTimeout)
+	}
 
 	port, err := freePort()
 	if err != nil {

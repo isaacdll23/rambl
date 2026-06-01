@@ -70,10 +70,18 @@ func New(st *store.Store, repoPath, base, selfExe, worktreeBase string) *Runner 
 	return &Runner{
 		store: st, repoPath: repoPath, base: base, selfExe: selfExe,
 		worktreeBase:       worktreeBase,
-		turnTimeout:        5 * time.Minute,
+		turnTimeout:        15 * time.Minute,
 		maxResolveAttempts: 2,
 		pollInterval:       500 * time.Millisecond,
 		workers:            map[string]*worker.Worker{},
+	}
+}
+
+// SetTurnTimeout overrides the per-turn worker timeout. Non-positive values
+// are ignored, preserving the existing value.
+func (r *Runner) SetTurnTimeout(d time.Duration) {
+	if d > 0 {
+		r.turnTimeout = d
 	}
 }
 

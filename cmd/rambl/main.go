@@ -5,6 +5,7 @@
 //	rambl monitor    read-only worker dashboard (--once for a snapshot)
 //	rambl env-once   drive the PM through one brief, non-interactively (verification)
 //	rambl doctor     environment preflight check (claude CLI, git, ~/.rambl)
+//	rambl config     get/set CLI settings (e.g. turn-timeout)
 //	rambl version    print version, commit, and build date
 //
 // Plus the hidden `__hook` subcommand, invoked by each worker's Stop hook.
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"rambl/internal/config"
 	"rambl/internal/doctor"
 	"rambl/internal/environment"
 	"rambl/internal/hook"
@@ -65,6 +67,8 @@ func main() {
 		envOnceCmd(os.Args[2:])
 	case "doctor":
 		doctorCmd()
+	case "config":
+		configCmd(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Printf("rambl %s (commit %s, built %s)\n", Version, Commit, BuildDate)
 	default:
@@ -80,6 +84,7 @@ func usage() {
   rambl monitor   -repo <path> [--once]     (read-only dashboard)
   rambl env-once  -repo <path> -brief <text>  (non-interactive verification)
   rambl doctor       check the environment (claude CLI, git, ~/.rambl)
+  rambl config       get/set CLI settings (e.g. turn-timeout)
   rambl version                             (print version info)`)
 	os.Exit(2)
 }
@@ -140,6 +145,72 @@ func doctorCmd() {
 	fmt.Print(doctor.RenderText(results))
 	if doctor.HasFailure(results) {
 		os.Exit(1)
+	}
+}
+
+// configCmd implements `rambl config <list|get|set|path>` over internal/config.
+// These take positional args, so no flag.FlagSet is needed.
+func configCmd(argv []string) {
+	configUsage := func() {
+		fmt.Fprintln(os.Stderr, `usage:
+  rambl config [list]           print the config path and all keys/values
+  rambl config get <key>        print one key's value
+  rambl config set <key> <val>  set a key and save
+  rambl config path             print the config file path`)
+		os.Exit(2)
+	}
+
+	action := "list"
+	if len(argv) > 0 {
+		action = argv[0]
+	}
+
+	switch action {
+	case "list":
+		path, err := config.Path()
+		check(err)
+		cfg, _ := config.Load()
+		fmt.Printf("config: %s\n", path)
+		for _, key := range config.Keys() {
+			val, err := config.Get(cfg, key)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
+			}
+			fmt.Printf("  %-14s%s\n", key, val)
+		}
+	case "get":
+		if len(argv) < 2 {
+			configUsage()
+		}
+		key := argv[1]
+		cfg, _ := config.Load()
+		val, err := config.Get(cfg, key)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		fmt.Println(val)
+	case "set":
+		if len(argv) < 3 {
+			configUsage()
+		}
+		key, value := argv[1], argv[2]
+		cfg, _ := config.Load()
+		cfg, err := config.Set(cfg, key, value)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		check(config.Save(cfg))
+		val, _ := config.Get(cfg, key)
+		fmt.Printf("set %s = %s\n", key, val)
+	case "path":
+		path, err := config.Path()
+		check(err)
+		fmt.Println(path)
+	default:
+		configUsage()
 	}
 }
 
