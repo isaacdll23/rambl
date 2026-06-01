@@ -3,6 +3,7 @@ package store
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestStoreLifecycle(t *testing.T) {
@@ -85,5 +86,40 @@ func TestStoreLifecycle(t *testing.T) {
 	// Missing task → nil, no error.
 	if missing, err := s2.GetTask(proj, "nope"); err != nil || missing != nil {
 		t.Fatalf("expected nil for missing task, got %v %v", missing, err)
+	}
+}
+
+func TestListProjects(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	if _, err := s.EnsureProject("/repo/alpha", "alpha"); err != nil {
+		t.Fatalf("ensure alpha: %v", err)
+	}
+	// Timestamps are second-precision (RFC3339); sleep past a second boundary
+	// so beta's last_opened_at is strictly greater than alpha's.
+	time.Sleep(1100 * time.Millisecond)
+	if _, err := s.EnsureProject("/repo/beta", "beta"); err != nil {
+		t.Fatalf("ensure beta: %v", err)
+	}
+
+	projects, err := s.ListProjects()
+	if err != nil {
+		t.Fatalf("list projects: %v", err)
+	}
+	if len(projects) != 2 {
+		t.Fatalf("want 2 projects, got %d", len(projects))
+	}
+	// Most-recently-ensured (beta) first.
+	if projects[0].Path != "/repo/beta" || projects[1].Path != "/repo/alpha" {
+		t.Fatalf("unexpected order: %s, %s", projects[0].Path, projects[1].Path)
+	}
+	if projects[0].LastOpenedAt.IsZero() {
+		t.Fatalf("expected non-zero LastOpenedAt, got zero")
 	}
 }

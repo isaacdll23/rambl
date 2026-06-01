@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -77,7 +78,8 @@ CREATE TABLE IF NOT EXISTS projects (
   id         TEXT PRIMARY KEY,
   path       TEXT UNIQUE NOT NULL,
   name       TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  last_opened_at TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS tasks (
   id         TEXT PRIMARY KEY,
@@ -103,8 +105,15 @@ CREATE TABLE IF NOT EXISTS task_deps (
 `
 
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(schema)
-	return err
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`ALTER TABLE projects ADD COLUMN last_opened_at TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return err
+		}
+	}
+	return nil
 }
 
 // EnsureProject returns the id of the project rooted at path, creating it if new.
@@ -112,15 +121,52 @@ func (s *Store) EnsureProject(path, name string) (string, error) {
 	var id string
 	err := s.db.QueryRow(`SELECT id FROM projects WHERE path = ?`, path).Scan(&id)
 	if err == nil {
+		if _, err := s.db.Exec(`UPDATE projects SET last_opened_at=? WHERE id=?`, now(), id); err != nil {
+			return "", err
+		}
 		return id, nil
 	}
 	if err != sql.ErrNoRows {
 		return "", err
 	}
 	id = newID()
-	_, err = s.db.Exec(`INSERT INTO projects (id, path, name, created_at) VALUES (?, ?, ?, ?)`,
-		id, path, name, now())
+	_, err = s.db.Exec(`INSERT INTO projects (id, path, name, created_at, last_opened_at) VALUES (?, ?, ?, ?, ?)`,
+		id, path, name, now(), now())
 	return id, err
+}
+
+// Project is a tracked repository rambl knows about.
+type Project struct {
+	ID           string
+	Path         string
+	Name         string
+	CreatedAt    time.Time
+	LastOpenedAt time.Time
+}
+
+// ListProjects returns every known project, most-recently-opened first
+// (falling back to created_at for rows never explicitly opened).
+func (s *Store) ListProjects() ([]*Project, error) {
+	rows, err := s.db.Query(`SELECT id, path, name, created_at, last_opened_at FROM projects
+		ORDER BY CASE WHEN last_opened_at = '' THEN created_at ELSE last_opened_at END DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Project
+	for rows.Next() {
+		p := &Project{}
+		var created, lastOpened string
+		if err := rows.Scan(&p.ID, &p.Path, &p.Name, &created, &lastOpened); err != nil {
+			return nil, err
+		}
+		p.CreatedAt, _ = time.Parse(time.RFC3339, created)
+		if lastOpened != "" {
+			p.LastOpenedAt, _ = time.Parse(time.RFC3339, lastOpened)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // ProjectID returns the id of the project at path, or "" if none exists.
