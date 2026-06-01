@@ -31,6 +31,7 @@ const (
 type Task struct {
 	ID        string // stable UUID (sync identity)
 	ProjectID string
+	FeatureID string // "" == standalone task (today's behavior); else the owning feature's id
 	Slug      string // human id, unique within a project; deps reference this
 	Title     string
 	Prompt    string
@@ -40,6 +41,29 @@ type Task struct {
 	Question  string // set when Status == NeedsInput (the worker's blocking question)
 	Result    string // the worker's latest assistant message (progress / done summary)
 	Deps      []string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// FeatureStatus is a feature's lifecycle state.
+type FeatureStatus string
+
+const (
+	FeaturePlanning    FeatureStatus = "planning"    // tasks being added, nothing dispatched
+	FeatureRunning     FeatureStatus = "running"     // tasks executing / merging
+	FeatureIntegrating FeatureStatus = "integrating" // integration gate working the branch
+	FeatureDone        FeatureStatus = "done"        // merged + PR opened
+	FeatureFailed      FeatureStatus = "failed"
+)
+
+// Feature groups multiple tasks that will later map to a single feature branch + PR.
+type Feature struct {
+	ID        string
+	ProjectID string
+	Slug      string
+	Title     string
+	Branch    string // "rambl/feat/<slug>", set once started; "" before
+	Status    FeatureStatus
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -111,6 +135,17 @@ CREATE TABLE IF NOT EXISTS events (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id);
+CREATE TABLE IF NOT EXISTS features (
+  id         TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  slug       TEXT NOT NULL,
+  title      TEXT NOT NULL,
+  branch     TEXT NOT NULL DEFAULT '',
+  status     TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(project_id, slug)
+);
 `
 
 func (s *Store) migrate() error {
@@ -118,6 +153,11 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if _, err := s.db.Exec(`ALTER TABLE projects ADD COLUMN last_opened_at TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(`ALTER TABLE tasks ADD COLUMN feature_id TEXT NOT NULL DEFAULT ''`); err != nil {
 		if !strings.Contains(err.Error(), "duplicate column") {
 			return err
 		}
@@ -188,10 +228,16 @@ func (s *Store) ProjectID(path string) (string, error) {
 	return id, err
 }
 
-// AddTask creates a task. deps are slugs within the same project.
+// AddTask creates a standalone task. deps are slugs within the same project.
 func (s *Store) AddTask(projectID, slug, title, prompt string, deps []string) (*Task, error) {
+	return s.AddTaskToFeature(projectID, "", slug, title, prompt, deps)
+}
+
+// AddTaskToFeature creates a task associated with featureID ("" for standalone).
+// deps are slugs within the same project.
+func (s *Store) AddTaskToFeature(projectID, featureID, slug, title, prompt string, deps []string) (*Task, error) {
 	t := &Task{
-		ID: newID(), ProjectID: projectID, Slug: slug, Title: title,
+		ID: newID(), ProjectID: projectID, FeatureID: featureID, Slug: slug, Title: title,
 		Prompt: prompt, Status: Todo, Deps: deps,
 		CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
@@ -201,9 +247,9 @@ func (s *Store) AddTask(projectID, slug, title, prompt string, deps []string) (*
 	}
 	defer tx.Rollback()
 	if _, err := tx.Exec(`INSERT INTO tasks
-		(id, project_id, slug, title, prompt, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, projectID, slug, title, prompt, string(Todo), iso(t.CreatedAt), iso(t.UpdatedAt)); err != nil {
+		(id, project_id, feature_id, slug, title, prompt, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, projectID, featureID, slug, title, prompt, string(Todo), iso(t.CreatedAt), iso(t.UpdatedAt)); err != nil {
 		return nil, err
 	}
 	for _, d := range deps {
@@ -226,7 +272,7 @@ func (s *Store) Update(t *Task) error {
 
 // ListTasks returns all tasks in a project (with deps), ordered by slug.
 func (s *Store) ListTasks(projectID string) ([]*Task, error) {
-	rows, err := s.db.Query(`SELECT id, project_id, slug, title, prompt, status, branch, session_id, question, result, created_at, updated_at
+	rows, err := s.db.Query(`SELECT id, project_id, feature_id, slug, title, prompt, status, branch, session_id, question, result, created_at, updated_at
 		FROM tasks WHERE project_id=? ORDER BY slug`, projectID)
 	if err != nil {
 		return nil, err
@@ -253,7 +299,7 @@ func (s *Store) ListTasks(projectID string) ([]*Task, error) {
 
 // GetTask fetches one task by slug within a project (nil if absent).
 func (s *Store) GetTask(projectID, slug string) (*Task, error) {
-	row := s.db.QueryRow(`SELECT id, project_id, slug, title, prompt, status, branch, session_id, question, result, created_at, updated_at
+	row := s.db.QueryRow(`SELECT id, project_id, feature_id, slug, title, prompt, status, branch, session_id, question, result, created_at, updated_at
 		FROM tasks WHERE project_id=? AND slug=?`, projectID, slug)
 	t, err := scanTask(row)
 	if err == sql.ErrNoRows {
@@ -293,13 +339,125 @@ func (s *Store) DeleteTask(projectID, slug string) error {
 	return tx.Commit()
 }
 
+// AddFeature creates a feature in status "planning"; errors on duplicate (project_id, slug).
+func (s *Store) AddFeature(projectID, slug, title string) (*Feature, error) {
+	f := &Feature{
+		ID: newID(), ProjectID: projectID, Slug: slug, Title: title,
+		Status: FeaturePlanning, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if _, err := s.db.Exec(`INSERT INTO features
+		(id, project_id, slug, title, branch, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.ID, projectID, slug, title, f.Branch, string(f.Status), iso(f.CreatedAt), iso(f.UpdatedAt)); err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// GetFeature returns the feature or (nil, nil) when not found.
+func (s *Store) GetFeature(projectID, slug string) (*Feature, error) {
+	row := s.db.QueryRow(`SELECT id, project_id, slug, title, branch, status, created_at, updated_at
+		FROM features WHERE project_id=? AND slug=?`, projectID, slug)
+	f, err := scanFeature(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// ListFeatures returns all features for the project, ordered by slug.
+func (s *Store) ListFeatures(projectID string) ([]*Feature, error) {
+	rows, err := s.db.Query(`SELECT id, project_id, slug, title, branch, status, created_at, updated_at
+		FROM features WHERE project_id=? ORDER BY slug`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Feature
+	for rows.Next() {
+		f, err := scanFeature(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// UpdateFeature persists title, branch, status and stamps updated_at.
+func (s *Store) UpdateFeature(f *Feature) error {
+	f.UpdatedAt = time.Now()
+	_, err := s.db.Exec(`UPDATE features SET title=?, branch=?, status=?, updated_at=?
+		WHERE id=?`,
+		f.Title, f.Branch, string(f.Status), iso(f.UpdatedAt), f.ID)
+	return err
+}
+
+// DeleteFeature removes the feature; errors if any task still references it.
+func (s *Store) DeleteFeature(projectID, slug string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var id string
+	err = tx.QueryRow(`SELECT id FROM features WHERE project_id=? AND slug=?`, projectID, slug).Scan(&id)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("no feature %q", slug)
+	}
+	if err != nil {
+		return err
+	}
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM tasks WHERE project_id=? AND feature_id=?`, projectID, id).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return fmt.Errorf("feature %q still has %d task(s)", slug, count)
+	}
+	if _, err := tx.Exec(`DELETE FROM features WHERE id=?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// TasksByFeature returns tasks with feature_id = featureID, ordered by slug, deps populated.
+func (s *Store) TasksByFeature(projectID, featureID string) ([]*Task, error) {
+	rows, err := s.db.Query(`SELECT id, project_id, feature_id, slug, title, prompt, status, branch, session_id, question, result, created_at, updated_at
+		FROM tasks WHERE project_id=? AND feature_id=? ORDER BY slug`, projectID, featureID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, t := range out {
+		if t.Deps, err = s.depsOf(projectID, t.Slug); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 // Event is one PM-activity entry (a record of a PM tool action).
 type Event struct {
 	ID        int64
 	ProjectID string
-	Kind      string    // short verb: "create" | "dispatch" | "send" | "delete" | "verify" | "revise" | "open_pr"
-	Slug      string    // task slug involved; may be ""
-	Summary   string    // human one-liner, e.g. "dispatched api-routes"
+	Kind      string // short verb: "create" | "dispatch" | "send" | "delete" | "verify" | "revise" | "open_pr"
+	Slug      string // task slug involved; may be ""
+	Summary   string // human one-liner, e.g. "dispatched api-routes"
 	CreatedAt time.Time
 }
 
@@ -360,7 +518,7 @@ type scanner interface {
 func scanTask(sc scanner) (*Task, error) {
 	t := &Task{}
 	var status, created, updated string
-	if err := sc.Scan(&t.ID, &t.ProjectID, &t.Slug, &t.Title, &t.Prompt, &status,
+	if err := sc.Scan(&t.ID, &t.ProjectID, &t.FeatureID, &t.Slug, &t.Title, &t.Prompt, &status,
 		&t.Branch, &t.SessionID, &t.Question, &t.Result, &created, &updated); err != nil {
 		return nil, err
 	}
@@ -368,6 +526,18 @@ func scanTask(sc scanner) (*Task, error) {
 	t.CreatedAt, _ = time.Parse(time.RFC3339, created)
 	t.UpdatedAt, _ = time.Parse(time.RFC3339, updated)
 	return t, nil
+}
+
+func scanFeature(sc scanner) (*Feature, error) {
+	f := &Feature{}
+	var status, created, updated string
+	if err := sc.Scan(&f.ID, &f.ProjectID, &f.Slug, &f.Title, &f.Branch, &status, &created, &updated); err != nil {
+		return nil, err
+	}
+	f.Status = FeatureStatus(status)
+	f.CreatedAt, _ = time.Parse(time.RFC3339, created)
+	f.UpdatedAt, _ = time.Parse(time.RFC3339, updated)
+	return f, nil
 }
 
 func now() string            { return iso(time.Now()) }
