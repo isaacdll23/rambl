@@ -11,12 +11,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"rambl/internal/store"
+	"rambl/internal/theme"
 )
 
 // Pick opens an interactive TUI to choose a repository to run rambl in.
@@ -348,12 +350,12 @@ func (e *notRepoError) Error() string { return "not a git repository: " + e.path
 // --- view ---
 
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true)
-	faintStyle    = lipgloss.NewStyle().Faint(true)
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
-	gitStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	cursorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	titleStyle    = theme.Header
+	faintStyle    = theme.Faint
+	selectedStyle = lipgloss.NewStyle().Foreground(theme.Blue).Bold(true)
+	gitStyle      = lipgloss.NewStyle().Foreground(theme.Green)
+	errStyle      = lipgloss.NewStyle().Foreground(theme.Red)
+	cursorStyle   = lipgloss.NewStyle().Foreground(theme.Blue)
 )
 
 func (m model) View() string {
@@ -399,7 +401,8 @@ func (m model) viewRecent() string {
 func (m model) viewPath() string {
 	var b strings.Builder
 	b.WriteString(faintStyle.Render("enter a path (~ expands to home)") + "\n\n")
-	b.WriteString("  " + m.input + cursorStyle.Render("█") + "\n")
+	box := theme.Box.BorderForeground(theme.Blue)
+	b.WriteString(box.Render(m.input+cursorStyle.Render("█")) + "\n")
 	return b.String()
 }
 
@@ -427,6 +430,9 @@ func (m model) viewBrowse() string {
 	if end > len(m.entries) {
 		end = len(m.entries)
 	}
+	if start > 0 {
+		b.WriteString(faintStyle.Render("  ↑ "+strconv.Itoa(start)+" more") + "\n")
+	}
 	for i := start; i < end; i++ {
 		e := m.entries[i]
 		cursor := "  "
@@ -442,6 +448,9 @@ func (m model) viewBrowse() string {
 			label = selectedStyle.Render(label)
 		}
 		b.WriteString(cursor + label + "\n")
+	}
+	if end < len(m.entries) {
+		b.WriteString(faintStyle.Render("  ↓ "+strconv.Itoa(len(m.entries)-end)+" more") + "\n")
 	}
 	return b.String()
 }

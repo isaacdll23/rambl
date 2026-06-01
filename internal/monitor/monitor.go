@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"rambl/internal/store"
+	"rambl/internal/theme"
 )
 
 // Once prints a single plain, static (non-animated) snapshot and returns.
@@ -194,28 +195,30 @@ func (m model) View() string {
 
 // --- rendering (shared by Once and the live View) ---
 
+// Thin aliases onto the shared theme package — single source of truth for the
+// palette and base styles, so the dashboard and picker stay visually in sync.
 var (
-	headerStyle = lipgloss.NewStyle().Bold(true)
-	faintStyle  = lipgloss.NewStyle().Faint(true)
-	boxStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	statusColor = map[store.Status]lipgloss.Color{
-		store.Todo:       lipgloss.Color("245"), // grey
-		store.Running:    lipgloss.Color("39"),  // blue
-		store.NeedsInput: lipgloss.Color("214"), // orange
-		store.Done:       lipgloss.Color("42"),  // green
-		store.Failed:     lipgloss.Color("203"), // red
-		store.Blocked:    lipgloss.Color("245"),
+	headerStyle = theme.Header
+	faintStyle  = theme.Faint
+	boxStyle    = theme.Box
+	statusColor = map[store.Status]lipgloss.TerminalColor{
+		store.Todo:       theme.Grey,
+		store.Running:    theme.Blue,
+		store.NeedsInput: theme.Orange,
+		store.Done:       theme.Green,
+		store.Failed:     theme.Red,
+		store.Blocked:    theme.Grey,
 	}
 	spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	idleFrames    = []string{"·", "•", "●", "•"}
 	// featureStatusColor maps a feature's lifecycle to the same palette the task
 	// statuses use, so a feature header reads at a glance alongside its rows.
-	featureStatusColor = map[store.FeatureStatus]lipgloss.Color{
-		store.FeaturePlanning:    lipgloss.Color("245"), // grey
-		store.FeatureRunning:     lipgloss.Color("39"),  // blue
-		store.FeatureIntegrating: lipgloss.Color("214"), // orange
-		store.FeatureDone:        lipgloss.Color("42"),  // green
-		store.FeatureFailed:      lipgloss.Color("203"), // red
+	featureStatusColor = map[store.FeatureStatus]lipgloss.TerminalColor{
+		store.FeaturePlanning:    theme.Grey,
+		store.FeatureRunning:     theme.Blue,
+		store.FeatureIntegrating: theme.Orange,
+		store.FeatureDone:        theme.Green,
+		store.FeatureFailed:      theme.Red,
 	}
 )
 
@@ -245,18 +248,50 @@ func render(v view) string {
 		return renderSplash(v.name, v.frame, v.animate, width, v.height)
 	}
 
+	header := renderHeader(v, width)
+	activity := renderActivity(v.events, width)
+
+	// Height-aware budget for the WORKERS section's variable content (the rows,
+	// feature headers, overflow indicators and the expanded panel). Counted as the
+	// terminal height minus every other line of chrome, then trimmed by a safety
+	// margin so we underestimate rather than overflow the alt-screen. A budget of
+	// 0 (the static Once snapshot passes height 0) disables windowing entirely.
+	workersBudget := 0
+	if v.height > 0 {
+		used := lineCount(header) + lineCount(activity)
+		used += 2 // the blank separator line before and after the WORKERS box
+		used += 4 // WORKERS box: top+bottom border, "WORKERS" title, column header
+		if v.animate {
+			used += 2 // footer: blank line + help line
+		}
+		workersBudget = v.height - used - 2 // -2 conservative safety margin
+		if workersBudget < 1 {
+			workersBudget = 1
+		}
+	}
+
 	var b strings.Builder
-	b.WriteString(renderHeader(v.name, v.tasks, v.startedAt, width))
+	b.WriteString(header)
+	b.WriteString("\n\n")
+	b.WriteString(renderWorkers(v, width, workersBudget))
+	b.WriteString("\n\n")
+	b.WriteString(activity)
 	b.WriteString("\n")
-	b.WriteString(renderWorkers(v, width))
-	b.WriteString("\n")
-	b.WriteString(renderActivity(v.events))
 	if v.animate {
 		b.WriteString("\n")
 		b.WriteString(faintStyle.Render("q quit · ↑↓ select · refreshes 1s"))
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// lineCount returns the number of display lines a rendered (newline-free-trailing)
+// block occupies.
+func lineCount(s string) int {
+	if s == "" {
+		return 0
+	}
+	return strings.Count(s, "\n") + 1
 }
 
 func renderSplash(name string, frame int, animate bool, width, height int) string {
@@ -275,17 +310,23 @@ func renderSplash(name string, frame int, animate bool, width, height int) strin
 	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, block)
 }
 
-func renderHeader(name string, tasks []*store.Task, startedAt time.Time, width int) string {
+func renderHeader(v view, width int) string {
 	inner := maxInt(width-4, 10)
-	left := headerStyle.Render("rambl · " + name)
-	right := faintStyle.Render("uptime " + age(startedAt))
+	running := 0
+	for _, t := range v.tasks {
+		if t.Status == store.Running {
+			running++
+		}
+	}
+	left := headerStyle.Render("rambl · " + v.name)
+	right := faintStyle.Render(fmt.Sprintf("%d running · %d total · uptime %s", running, len(v.tasks), age(v.startedAt)))
 	titleLine := padBetween(left, right, inner)
-	gaugeLine := renderGauges(tasks, inner)
+	gaugeLine := renderGauges(v.tasks, v.frame, v.animate, inner)
 	content := lipgloss.JoinVertical(lipgloss.Left, titleLine, gaugeLine)
-	return boxStyle.Width(maxInt(width-2, 12)).Render(content) + "\n"
+	return boxStyle.Width(maxInt(width-2, 12)).Render(content)
 }
 
-func renderGauges(tasks []*store.Task, width int) string {
+func renderGauges(tasks []*store.Task, frame int, animate bool, width int) string {
 	total := len(tasks)
 	counts := map[store.Status]int{}
 	for _, t := range tasks {
@@ -308,8 +349,9 @@ func renderGauges(tasks []*store.Task, width int) string {
 		if c == 0 {
 			continue
 		}
+		g := lipgloss.NewStyle().Foreground(statusColor[o.st]).Render(glyph(o.st, frame, animate))
 		seg := lipgloss.NewStyle().Foreground(statusColor[o.st]).Render(bar(c, total, 6))
-		parts = append(parts, fmt.Sprintf("%s %s %d", o.label, seg, c))
+		parts = append(parts, fmt.Sprintf("%s %s %s %d", g, o.label, seg, c))
 	}
 	if len(parts) == 0 {
 		return faintStyle.Render("no tasks")
@@ -335,7 +377,12 @@ func bar(count, total, width int) string {
 	return strings.Repeat("▓", filled) + strings.Repeat("░", width-filled)
 }
 
-func renderWorkers(v view, width int) string {
+// rowBudget is the number of display lines available for the WORKERS section's
+// variable content (rows, feature headers, overflow indicators and the expanded
+// panel). When it is <= 0 (the static Once snapshot) the list is never windowed
+// and every row renders.
+func renderWorkers(v view, width, rowBudget int) string {
+	inner := maxInt(width-4, 12)
 	var b strings.Builder
 	counts := map[store.Status]int{}
 	for _, t := range v.tasks {
@@ -344,6 +391,16 @@ func renderWorkers(v view, width int) string {
 
 	b.WriteString(headerStyle.Render("WORKERS"))
 	b.WriteString("\n")
+	// Column header aligned to the data rows: 4 leading cols for the marker (2)
+	// and glyph + space (2), then the status/slug/age/detail cells at their
+	// fixed widths. When rows are indented under feature headers it sits 2 cols
+	// to the left of the data — an acceptable mismatch.
+	b.WriteString(faintStyle.Render("    " + fmt.Sprintf("%-11s %-16s %-5s %s", "STATUS", "TASK", "AGE", "DETAIL")))
+	b.WriteString("\n")
+
+	// The idle banner (shown when nothing is running) consumes one line of the
+	// budget before any rows.
+	contentBudget := rowBudget
 	if counts[store.Running] == 0 {
 		spin := spinnerFrames[0]
 		if v.animate {
@@ -355,11 +412,8 @@ func renderWorkers(v view, width int) string {
 		}
 		b.WriteString(faintStyle.Render(fmt.Sprintf("  %s idle · waiting for a worker …   last PM action: %s", spin, last)))
 		b.WriteString("\n")
+		contentBudget--
 	}
-
-	// detail column gets whatever width is left after the fixed columns.
-	const fixed = 2 + 1 + 1 + 11 + 1 + 16 + 1 + 5 + 1
-	detailMax := maxInt(width-fixed, 8)
 
 	// Build the grouped display order. `selected` indexes this flat sequence.
 	groups := groupTasks(v.tasks, v.features)
@@ -371,9 +425,69 @@ func renderWorkers(v view, width int) string {
 		}
 	}
 
-	idx := 0 // running position in the flat grouped order, matched against v.selected
-	for _, grp := range groups {
+	// detail column gets whatever inner width is left after the fixed columns
+	// (and the 2-col indent when rows nest under feature headers).
+	const fixed = 2 + 1 + 1 + 11 + 1 + 16 + 1 + 5 + 1
+	fixedCols := fixed
+	if grouped {
+		fixedCols += 2
+	}
+	detailMax := maxInt(inner-fixedCols, 8)
+
+	total := len(v.tasks)
+	sel := v.selected
+	if sel < 0 {
+		sel = 0
+	}
+	if sel >= total {
+		sel = total - 1
+	}
+
+	// Choose the visible window [start, end) over the flat grouped row order,
+	// keeping the selected row on screen. When rowBudget <= 0 (static snapshot)
+	// or every row already fits, the window spans the whole list.
+	start, end := 0, total
+	windowed := rowBudget > 0 && total > 0
+	if windowed {
+		// Reserve space for the expanded panel of the selected row, the (up to two)
+		// overflow indicators, and — conservatively — a header line per group so a
+		// feature header never tips us over the budget.
+		panelLines := strings.Count(renderExpanded(v.tasks[sel], width), "\n")
+		headerReserve := 0
 		if grouped {
+			headerReserve = len(groups)
+		}
+		maxRows := contentBudget - panelLines - 2 - headerReserve
+		if maxRows < 1 {
+			maxRows = 1
+		}
+		if total > maxRows {
+			start = 0
+			if sel >= maxRows {
+				start = sel - maxRows + 1
+			}
+			end = start + maxRows
+			if end > total {
+				end = total
+				start = maxInt(0, end-maxRows)
+			}
+		}
+	}
+
+	// Overflow affordance: rows hidden above the window.
+	if start > 0 {
+		b.WriteString(faintStyle.Render(fmt.Sprintf("  ↑ %d more", start)))
+		b.WriteString("\n")
+	}
+
+	idx := 0 // running position in the flat grouped order, matched against sel
+	for _, grp := range groups {
+		// Only print a group's header if at least one of its rows is within the
+		// window, so a header is never stranded with no visible rows beneath it.
+		groupStart := idx
+		groupEnd := idx + len(grp.tasks)
+		anyVisible := groupStart < end && groupEnd > start
+		if grouped && anyVisible {
 			if grp.feature != nil {
 				b.WriteString(renderFeatureHeader(grp.feature))
 			} else {
@@ -382,13 +496,17 @@ func renderWorkers(v view, width int) string {
 			b.WriteString("\n")
 		}
 		for _, t := range grp.tasks {
+			if idx < start || idx >= end {
+				idx++
+				continue
+			}
 			g := lipgloss.NewStyle().Foreground(statusColor[t.Status]).Render(glyph(t.Status, v.frame, v.animate))
 			statusCell := lipgloss.NewStyle().Foreground(statusColor[t.Status]).Render(fmt.Sprintf("%-11s", string(t.Status)))
 			slug := fmt.Sprintf("%-16s", truncate(t.Slug, 16))
 			row := fmt.Sprintf("%s %s %s %-5s %s", g, statusCell, slug, age(t.UpdatedAt), truncate(detailOf(t), detailMax))
 
 			marker := "  "
-			if idx == v.selected {
+			if idx == sel {
 				marker = lipgloss.NewStyle().Foreground(statusColor[t.Status]).Bold(true).Render("▌ ")
 				row = lipgloss.NewStyle().Bold(true).Render(row)
 			}
@@ -398,13 +516,19 @@ func renderWorkers(v view, width int) string {
 			}
 			b.WriteString(indent + marker + row + "\n")
 
-			if idx == v.selected {
+			if idx == sel {
 				b.WriteString(renderExpanded(t, width))
 			}
 			idx++
 		}
 	}
-	return b.String()
+
+	// Overflow affordance: rows hidden below the window.
+	if end < total {
+		b.WriteString(faintStyle.Render(fmt.Sprintf("  ↓ %d more", total-end)))
+		b.WriteString("\n")
+	}
+	return boxStyle.Width(maxInt(width-2, 12)).Render(strings.TrimRight(b.String(), "\n"))
 }
 
 // taskGroup is one bucket in the grouped WORKERS view: a feature (nil for the
@@ -477,27 +601,35 @@ func renderExpanded(t *store.Task, width int) string {
 		lipgloss.NewStyle().Width(inner).Render(full),
 		faintStyle.Render(fmt.Sprintf("branch: %s   deps: %s", branch, deps)),
 	)
-	return lipgloss.NewStyle().PaddingLeft(4).Render(body) + "\n"
+	// A colored left border bar marks the drill-down as belonging to the
+	// selected row, tinted by that task's status.
+	return lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder(), false, false, false, true).
+		BorderForeground(statusColor[t.Status]).
+		PaddingLeft(1).
+		Render(body) + "\n"
 }
 
-func renderActivity(events []*store.Event) string {
+func renderActivity(events []*store.Event, width int) string {
+	inner := maxInt(width-4, 12)
 	var b strings.Builder
 	b.WriteString(headerStyle.Render("PM ACTIVITY"))
 	b.WriteString("\n")
 	if len(events) == 0 {
 		b.WriteString(faintStyle.Render("  (no PM activity yet)"))
-		b.WriteString("\n")
-		return b.String()
+		return boxStyle.Width(maxInt(width-2, 12)).Render(strings.TrimRight(b.String(), "\n"))
 	}
 	n := len(events)
 	if n > 8 {
 		n = 8
 	}
+	// "  " + age (%-4s) + " " = 7 cols before the summary.
+	summaryMax := maxInt(inner-7, 8)
 	for _, e := range events[:n] {
-		b.WriteString(faintStyle.Render(fmt.Sprintf("  %-4s %s", age(e.CreatedAt), e.Summary)))
+		b.WriteString(faintStyle.Render(fmt.Sprintf("  %-4s %s", age(e.CreatedAt), truncate(e.Summary, summaryMax))))
 		b.WriteString("\n")
 	}
-	return b.String()
+	return boxStyle.Width(maxInt(width-2, 12)).Render(strings.TrimRight(b.String(), "\n"))
 }
 
 // glyph returns the per-status indicator: an animated braille spinner for
