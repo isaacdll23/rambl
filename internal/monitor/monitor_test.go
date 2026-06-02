@@ -207,6 +207,77 @@ func TestRenderGroupedSelectionOrder(t *testing.T) {
 	}
 }
 
+// TestRenderActivityFeed verifies a running task with a tool-activity feed shows
+// the most recent action inline and the recent-activity list in its expanded panel.
+func TestRenderActivityFeed(t *testing.T) {
+	now := time.Now()
+	tasks := []*store.Task{
+		{
+			Slug:      "build-thing",
+			Status:    store.Running,
+			Result:    "working",
+			UpdatedAt: now.Add(-30 * time.Second),
+			Branch:    "feat/thing",
+			Activity: []store.Activity{
+				{Kind: "tool", Tool: "Read", Detail: "internal/foo.go"},
+				{Kind: "tool", Tool: "Bash", Detail: "go test ./..."},
+			},
+		},
+	}
+	out := render(view{
+		name:      "demo",
+		tasks:     tasks,
+		selected:  0,
+		startedAt: now.Add(-time.Hour),
+		width:     100,
+		height:    40,
+		animate:   true,
+	})
+	wants := []string{
+		"Bash go test ./...",   // current action inline (last activity)
+		"recent activity:",     // recent-activity header in the expanded panel
+		"Read internal/foo.go", // an earlier activity in the recent list
+	}
+	for _, w := range wants {
+		if !strings.Contains(out, w) {
+			t.Errorf("activity render missing %q\n---\n%s", w, out)
+		}
+	}
+}
+
+// TestRenderStartingStatus verifies a starting task renders without panicking,
+// shows the "spawning session…" detail, and contributes a START gauge segment.
+func TestRenderStartingStatus(t *testing.T) {
+	now := time.Now()
+	tasks := []*store.Task{
+		{Slug: "spawning-task", Status: store.Starting, UpdatedAt: now.Add(-2 * time.Second)},
+	}
+	out := render(view{
+		name:      "demo",
+		tasks:     tasks,
+		selected:  0,
+		startedAt: now.Add(-time.Hour),
+		width:     100,
+		height:    40,
+		animate:   true,
+	})
+	if !strings.Contains(out, "spawning session…") {
+		t.Errorf("starting task detail missing 'spawning session…'\n---\n%s", out)
+	}
+	if !strings.Contains(out, "START") {
+		t.Errorf("expected a START gauge segment when a starting task exists\n---\n%s", out)
+	}
+}
+
+// TestDetailFallsBackToResult verifies a running task with no activity feed still
+// falls back to its Result line (existing behavior preserved).
+func TestDetailFallsBackToResult(t *testing.T) {
+	tk := &store.Task{Slug: "x", Status: store.Running, Result: "wiring handlers"}
+	if got := detailOf(tk); got != "wiring handlers" {
+		t.Errorf("detailOf with empty activity = %q, want %q", got, "wiring handlers")
+	}
+}
+
 // TestRenderWindowsToHeight drives render() with far more tasks than fit in a
 // small terminal and a selection near the bottom. The selected row must stay on
 // screen and an overflow indicator must signal the hidden rows above it.

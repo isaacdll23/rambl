@@ -203,6 +203,7 @@ var (
 	boxStyle    = theme.Box
 	statusColor = map[store.Status]lipgloss.TerminalColor{
 		store.Todo:       theme.Grey,
+		store.Starting:   theme.Blue,
 		store.Running:    theme.Blue,
 		store.NeedsInput: theme.Orange,
 		store.Done:       theme.Green,
@@ -336,6 +337,7 @@ func renderGauges(tasks []*store.Task, frame int, animate bool, width int) strin
 		st    store.Status
 		label string
 	}{
+		{store.Starting, "START"},
 		{store.Running, "RUN"},
 		{store.NeedsInput, "NEED"},
 		{store.Done, "DONE"},
@@ -597,10 +599,21 @@ func renderExpanded(t *store.Task, width int) string {
 	if branch == "" {
 		branch = "-"
 	}
-	body := lipgloss.JoinVertical(lipgloss.Left,
+	lines := []string{
 		lipgloss.NewStyle().Width(inner).Render(full),
 		faintStyle.Render(fmt.Sprintf("branch: %s   deps: %s", branch, deps)),
-	)
+	}
+	if len(t.Activity) > 0 {
+		acts := t.Activity
+		if len(acts) > 8 {
+			acts = acts[len(acts)-8:]
+		}
+		lines = append(lines, faintStyle.Render("recent activity:"))
+		for _, a := range acts {
+			lines = append(lines, faintStyle.Render(truncate("  "+formatActivity(a), inner)))
+		}
+	}
+	body := lipgloss.JoinVertical(lipgloss.Left, lines...)
 	// A colored left border bar marks the drill-down as belonging to the
 	// selected row, tinted by that task's status.
 	return lipgloss.NewStyle().
@@ -635,7 +648,7 @@ func renderActivity(events []*store.Event, width int) string {
 // glyph returns the per-status indicator: an animated braille spinner for
 // running tasks (frame 0 when not animating), a static rune otherwise.
 func glyph(s store.Status, frame int, animate bool) string {
-	if s == store.Running {
+	if s == store.Running || s == store.Starting {
 		if animate {
 			return spinnerFrames[frame%len(spinnerFrames)]
 		}
@@ -660,7 +673,21 @@ func detailOf(t *store.Task) string {
 	if t.Status == store.NeedsInput && t.Question != "" {
 		return "? " + firstLine(t.Question)
 	}
+	if t.Status == store.Starting {
+		return "spawning session…"
+	}
+	if t.Status == store.Running && len(t.Activity) > 0 {
+		return formatActivity(t.Activity[len(t.Activity)-1])
+	}
 	return firstLine(t.Result)
+}
+
+// formatActivity renders one Activity as a compact one-liner, e.g. "Edit internal/foo.go" or "Bash go test ./...".
+func formatActivity(a store.Activity) string {
+	if a.Detail != "" {
+		return a.Tool + " " + a.Detail
+	}
+	return a.Tool
 }
 
 // fullDetailOf is the un-truncated detail shown in the expanded panel.
