@@ -366,6 +366,99 @@ func TestPMEventsLogged(t *testing.T) {
 	}
 }
 
+// TestWorkerStatusActivity asserts that the live activity feed set via
+// store.SetActivity surfaces in the JSON worker_status returns (the tasksJSON
+// path), and likewise for a feature's tasks via featuresJSON.
+func TestWorkerStatusActivity(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	proj, err := st.EnsureProject("/repo/calc", "calc")
+	if err != nil {
+		t.Fatalf("project: %v", err)
+	}
+
+	if _, err := st.AddTask(proj, "core", "Core", "build core", nil); err != nil {
+		t.Fatalf("add core: %v", err)
+	}
+	acts := []store.Activity{
+		{Kind: "tool", Tool: "Edit", Detail: "main.go"},
+		{Kind: "tool", Tool: "Bash", Detail: "go test ./..."},
+	}
+	if err := st.SetActivity(proj, "core", acts); err != nil {
+		t.Fatalf("set activity: %v", err)
+	}
+
+	// tasksJSON path (the same path worker_status uses).
+	res, err := tasksJSON(st, proj, "core")
+	if err != nil {
+		t.Fatalf("tasksJSON: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tasksJSON returned error: %s", textOf(t, res))
+	}
+	var views []struct {
+		Slug     string           `json:"slug"`
+		Activity []store.Activity `json:"activity"`
+	}
+	if err := json.Unmarshal([]byte(textOf(t, res)), &views); err != nil {
+		t.Fatalf("tasksJSON json: %v\n%s", err, textOf(t, res))
+	}
+	if len(views) != 1 {
+		t.Fatalf("want 1 task, got %d: %s", len(views), textOf(t, res))
+	}
+	assertActivity(t, "tasksJSON", views[0].Activity)
+
+	// featuresJSON path: a feature task carries the same activity.
+	f, err := st.AddFeature(proj, "auth", "Auth")
+	if err != nil {
+		t.Fatalf("add feature: %v", err)
+	}
+	if _, err := st.AddTaskToFeature(proj, f.ID, "login", "Login", "build login", nil); err != nil {
+		t.Fatalf("add login: %v", err)
+	}
+	if err := st.SetActivity(proj, "login", acts); err != nil {
+		t.Fatalf("set activity (login): %v", err)
+	}
+	fres, err := featuresJSON(st, proj, "auth")
+	if err != nil {
+		t.Fatalf("featuresJSON: %v", err)
+	}
+	if fres.IsError {
+		t.Fatalf("featuresJSON returned error: %s", textOf(t, fres))
+	}
+	var fviews []struct {
+		Slug  string `json:"slug"`
+		Tasks []struct {
+			Slug     string           `json:"slug"`
+			Activity []store.Activity `json:"activity"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal([]byte(textOf(t, fres)), &fviews); err != nil {
+		t.Fatalf("featuresJSON json: %v\n%s", err, textOf(t, fres))
+	}
+	if len(fviews) != 1 || len(fviews[0].Tasks) != 1 {
+		t.Fatalf("want 1 feature with 1 task, got %+v", fviews)
+	}
+	assertActivity(t, "featuresJSON", fviews[0].Tasks[0].Activity)
+}
+
+// assertActivity checks the two-entry Edit/Bash feed produced in
+// TestWorkerStatusActivity.
+func assertActivity(t *testing.T, where string, got []store.Activity) {
+	t.Helper()
+	if len(got) != 2 {
+		t.Fatalf("%s: want 2 activity entries, got %d: %+v", where, len(got), got)
+	}
+	if got[0].Tool != "Edit" || got[0].Detail != "main.go" {
+		t.Errorf("%s: activity[0] = %+v, want Edit/main.go", where, got[0])
+	}
+	if got[1].Tool != "Bash" || got[1].Detail != "go test ./..." {
+		t.Errorf("%s: activity[1] = %+v, want Bash/go test ./...", where, got[1])
+	}
+}
+
 // TestCreateSummary covers the only per-tool summary with branching: the deps
 // suffix appears only for non-empty deps.
 func TestCreateSummary(t *testing.T) {

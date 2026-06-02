@@ -47,9 +47,11 @@ func branchName(spec Spec) string {
 
 // Turn is the outcome of one prompt→completion cycle.
 type Turn struct {
-	Reply      string // final assistant text of the turn
-	DurationMs int    // from the transcript's system summary line
-	TimedOut   bool   // true if we fell back to timeout instead of a Stop signal
+	Reply         string // final assistant text of the turn
+	DurationMs    int    // from the transcript's system summary line
+	TimedOut      bool   // true if we fell back to timeout instead of a Stop signal
+	ProcessExited bool   // the claude process exited before signalling turn completion
+	ExitReason    string // diagnostic: exit error + last session output (set when ProcessExited)
 }
 
 // Worker manages one worktree-isolated autonomous session.
@@ -232,11 +234,16 @@ func (w *Worker) Send(ctx context.Context, prompt string) (Turn, error) {
 	}
 
 	var timedOut bool
+	var processExited bool
 	select {
 	case p := <-w.hookln.C:
 		if p.SessionID != "" {
 			w.SessionID = p.SessionID
 		}
+	case <-w.sess.Exited():
+		// The process died mid-turn (crash/exit) — fail fast instead of
+		// blocking until the timeout.
+		processExited = true
 	case <-time.After(w.TurnTimeout):
 		timedOut = true
 	case <-ctx.Done():
@@ -248,7 +255,28 @@ func (w *Worker) Send(ctx context.Context, prompt string) (Turn, error) {
 	if sid != "" {
 		w.SessionID = sid
 	}
-	return Turn{Reply: reply, DurationMs: dur, TimedOut: timedOut}, nil
+	t := Turn{Reply: reply, DurationMs: dur, TimedOut: timedOut}
+	if processExited {
+		t.ProcessExited = true
+		t.ExitReason = fmt.Sprintf("session exited (%v): %s", w.sess.ExitErr(), w.sess.Tail())
+	}
+	return t, nil
+}
+
+// Activity returns the worker's live tool-activity feed (nil if not started).
+func (w *Worker) Activity() []transcript.Activity {
+	if w.tail == nil {
+		return nil
+	}
+	return w.tail.Recent()
+}
+
+// SessionTail returns the last chunk of the session's PTY output, for diagnostics.
+func (w *Worker) SessionTail() string {
+	if w.sess == nil {
+		return ""
+	}
+	return w.sess.Tail()
 }
 
 // Changes returns a short summary of what the worker did to its worktree

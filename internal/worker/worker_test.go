@@ -32,6 +32,19 @@ func newRepo(t *testing.T) string {
 	return repo
 }
 
+// TestAccessorsBeforeStart verifies the diagnostic accessors are safe on a
+// freshly-constructed worker (no tailer/session yet) and return zero values
+// rather than panicking.
+func TestAccessorsBeforeStart(t *testing.T) {
+	w := New(Spec{ID: "x"})
+	if got := w.Activity(); got != nil {
+		t.Errorf("Activity() on unstarted worker = %v, want nil", got)
+	}
+	if got := w.SessionTail(); got != "" {
+		t.Errorf("SessionTail() on unstarted worker = %q, want \"\"", got)
+	}
+}
+
 func TestBranchName(t *testing.T) {
 	if got := branchName(Spec{ID: "login"}); got != "rambl/login" {
 		t.Errorf("branchName with empty Branch = %q, want rambl/login", got)

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"rambl/internal/store"
+	"rambl/internal/transcript"
 	"rambl/internal/worker"
 )
 
@@ -127,12 +128,13 @@ func (r *Runner) Dispatch(projectID, slug string) error {
 	}
 	r.mu.Unlock()
 
-	t.Status = store.Running
+	t.Status = store.Starting
 	t.Branch = "rambl/" + slug
 	t.Question = ""
 	if err := r.store.Update(t); err != nil {
 		return err
 	}
+	_ = r.store.SetActivity(projectID, slug, nil) // clear any stale feed from a prior run
 	go r.start(projectID, slug, t.Prompt, mergeRefs)
 	return nil
 }
@@ -203,7 +205,13 @@ func (r *Runner) start(projectID, slug, prompt string, mergeRefs []string) {
 	r.cancels[slug] = runCancel
 	r.mu.Unlock()
 
-	turn, err := w.Run(runCtx)
+	// The REPL is live and we're about to send the prompt: flip starting→running.
+	if t2, _ := r.store.GetTask(projectID, slug); t2 != nil {
+		t2.Status = store.Running
+		_ = r.store.Update(t2)
+	}
+
+	turn, err := r.withHeartbeat(projectID, slug, w, func() (worker.Turn, error) { return w.Run(runCtx) })
 
 	// If we were retired out from under us (by Stop or Delete) while blocked in
 	// Run, the terminal status is already set — bow out without clobbering it.
@@ -219,6 +227,41 @@ func (r *Runner) start(projectID, slug, prompt string, mergeRefs []string) {
 		return
 	}
 	r.apply(projectID, slug, w, turn)
+}
+
+// withHeartbeat runs fn (a turn) while flushing w.Activity() to the store every
+// ~1.5s so the monitor and worker_status show live progress. It clears the feed
+// when the turn ends (terminal rows show Result/Question instead).
+func (r *Runner) withHeartbeat(projectID, slug string, w *worker.Worker, fn func() (worker.Turn, error)) (worker.Turn, error) {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(1500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				_ = r.store.SetActivity(projectID, slug, toStoreActivity(w.Activity()))
+			}
+		}
+	}()
+	turn, err := fn()
+	close(done)
+	_ = r.store.SetActivity(projectID, slug, nil) // clear on turn end
+	return turn, err
+}
+
+// toStoreActivity maps the transcript feed to the store's Activity type.
+func toStoreActivity(in []transcript.Activity) []store.Activity {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]store.Activity, len(in))
+	for i, a := range in {
+		out[i] = store.Activity{Kind: a.Kind, Tool: a.Tool, Detail: a.Detail}
+	}
+	return out
 }
 
 // featureWorktree returns the integration worktree path for a feature. The
@@ -650,7 +693,7 @@ func (r *Runner) Send(projectID, slug, message string) error {
 		return err
 	}
 	go func() {
-		turn, err := w.Send(context.Background(), message)
+		turn, err := r.withHeartbeat(projectID, slug, w, func() (worker.Turn, error) { return w.Send(context.Background(), message) })
 		if err != nil {
 			r.fail(projectID, slug, "send: "+err.Error())
 			return
@@ -947,7 +990,7 @@ func (r *Runner) Revise(projectID, slug, message string) error {
 		r.workers[slug] = nw
 		r.mu.Unlock()
 
-		turn, err := nw.Run(context.Background())
+		turn, err := r.withHeartbeat(projectID, slug, nw, func() (worker.Turn, error) { return nw.Run(context.Background()) })
 		if err != nil {
 			r.fail(projectID, slug, "revise run: "+err.Error())
 			return
@@ -1066,6 +1109,30 @@ func (r *Runner) apply(projectID, slug string, w *worker.Worker, turn worker.Tur
 
 	if turn.TimedOut {
 		t.Status = store.Failed
+		t.Question = ""
+		_ = r.store.Update(t)
+		r.retire(slug)
+		return
+	}
+
+	// Process exited mid-turn: the session crashed/died before signalling done.
+	if turn.ProcessExited {
+		t.Status = store.Failed
+		reason := turn.ExitReason
+		if len(reason) > 2000 {
+			reason = reason[:2000] + "…"
+		}
+		t.Result = "session exited before completing the turn: " + reason
+		t.Question = ""
+		_ = r.store.Update(t)
+		r.retire(slug)
+		return
+	}
+
+	// Empty output: crashed immediately / never produced an assistant message.
+	if strings.TrimSpace(turn.Reply) == "" {
+		t.Status = store.Failed
+		t.Result = "worker produced no output (the session may have crashed or never started its turn)"
 		t.Question = ""
 		_ = r.store.Update(t)
 		r.retire(slug)

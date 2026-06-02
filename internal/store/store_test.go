@@ -220,6 +220,112 @@ func TestDeleteTaskTwice(t *testing.T) {
 	}
 }
 
+func TestActivity(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	proj, err := s.EnsureProject("/repo/calc", "calc")
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	if _, err := s.AddTask(proj, "core", "Core lib", "build core", nil); err != nil {
+		t.Fatalf("add core: %v", err)
+	}
+
+	acts := []Activity{
+		{Kind: "tool", Tool: "Edit", Detail: "internal/store/store.go"},
+		{Kind: "tool", Tool: "Bash", Detail: "go test ./..."},
+	}
+	if err := s.SetActivity(proj, "core", acts); err != nil {
+		t.Fatalf("set activity: %v", err)
+	}
+
+	// Round-trip via GetTask, preserving order.
+	got, err := s.GetTask(proj, "core")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(got.Activity) != 2 {
+		t.Fatalf("want 2 activities, got %d: %+v", len(got.Activity), got.Activity)
+	}
+	if got.Activity[0] != acts[0] || got.Activity[1] != acts[1] {
+		t.Fatalf("activity round-trip mismatch: %+v", got.Activity)
+	}
+
+	// Round-trip via ListTasks too.
+	tasks, err := s.ListTasks(proj)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(tasks) != 1 || len(tasks[0].Activity) != 2 ||
+		tasks[0].Activity[0] != acts[0] || tasks[0].Activity[1] != acts[1] {
+		t.Fatalf("list activity mismatch: %+v", tasks)
+	}
+
+	// SetActivity must NOT change UpdatedAt (the heartbeat uses it ~every 1.5s).
+	before := got.UpdatedAt
+	time.Sleep(5 * time.Millisecond)
+	if err := s.SetActivity(proj, "core", []Activity{{Kind: "tool", Tool: "Read", Detail: "main.go"}}); err != nil {
+		t.Fatalf("set activity again: %v", err)
+	}
+	after, err := s.GetTask(proj, "core")
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if !after.UpdatedAt.Equal(before) {
+		t.Fatalf("SetActivity changed UpdatedAt: before %v, after %v", before, after.UpdatedAt)
+	}
+
+	// SetActivity(nil) clears the feed.
+	if err := s.SetActivity(proj, "core", nil); err != nil {
+		t.Fatalf("clear activity: %v", err)
+	}
+	cleared, err := s.GetTask(proj, "core")
+	if err != nil {
+		t.Fatalf("get cleared: %v", err)
+	}
+	if len(cleared.Activity) != 0 {
+		t.Fatalf("expected empty activity after clear, got %+v", cleared.Activity)
+	}
+}
+
+func TestStartingStatusRoundTrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	proj, err := s.EnsureProject("/repo/calc", "calc")
+	if err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	task, err := s.AddTask(proj, "core", "Core lib", "build core", nil)
+	if err != nil {
+		t.Fatalf("add core: %v", err)
+	}
+
+	task.Status = Starting
+	if err := s.Update(task); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	got, err := s.GetTask(proj, "core")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != Starting || string(got.Status) != "starting" {
+		t.Fatalf("status round-trip = %q, want \"starting\"", got.Status)
+	}
+}
+
 func TestListProjects(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 

@@ -8,6 +8,7 @@ package store
 import (
 	"crypto/rand"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -21,11 +22,20 @@ type Status string
 const (
 	Todo       Status = "todo"
 	Running    Status = "running"
+	Starting   Status = "starting"    // session is spawning; the REPL is not yet live / the prompt is not yet in flight
 	NeedsInput Status = "needs_input" // worker reported BLOCKED; awaiting the PM (or you)
 	Done       Status = "done"
 	Failed     Status = "failed"
 	Blocked    Status = "blocked" // a dependency failed / could not be integrated
 )
+
+// Activity is one compact record of something a worker did in its live
+// session, surfaced to the monitor and to worker_status while the worker runs.
+type Activity struct {
+	Kind   string `json:"kind"`   // "tool" or "text" (currently always "tool")
+	Tool   string `json:"tool"`   // tool name when Kind=="tool" (e.g. "Edit", "Bash"); "" otherwise
+	Detail string `json:"detail"` // compact summary: a file path, a command, a pattern, or a text snippet
+}
 
 // Task is one unit of work plus its runtime state.
 type Task struct {
@@ -38,8 +48,9 @@ type Task struct {
 	Status    Status
 	Branch    string
 	SessionID string
-	Question  string // set when Status == NeedsInput (the worker's blocking question)
-	Result    string // the worker's latest assistant message (progress / done summary)
+	Question  string     // set when Status == NeedsInput (the worker's blocking question)
+	Result    string     // the worker's latest assistant message (progress / done summary)
+	Activity  []Activity // live tool-activity feed while the worker runs (nil when idle/none)
 	Deps      []string
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -116,6 +127,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   session_id TEXT NOT NULL DEFAULT '',
   question   TEXT NOT NULL DEFAULT '',
   result     TEXT NOT NULL DEFAULT '',
+  activity   TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(project_id, slug)
@@ -158,6 +170,11 @@ func (s *Store) migrate() error {
 		}
 	}
 	if _, err := s.db.Exec(`ALTER TABLE tasks ADD COLUMN feature_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(`ALTER TABLE tasks ADD COLUMN activity TEXT NOT NULL DEFAULT ''`); err != nil {
 		if !strings.Contains(err.Error(), "duplicate column") {
 			return err
 		}
@@ -270,9 +287,28 @@ func (s *Store) Update(t *Task) error {
 	return err
 }
 
+// SetActivity replaces the task's live activity feed. It updates ONLY the
+// activity column and deliberately does NOT touch updated_at — the heartbeat
+// calls this ~every 1.5s while a worker runs and must not reset the row's age
+// (the monitor renders age from updated_at). Passing a nil/empty slice clears
+// the feed (stores ”).
+func (s *Store) SetActivity(projectID, slug string, acts []Activity) error {
+	activityJSON := ""
+	if len(acts) > 0 {
+		b, err := json.Marshal(acts)
+		if err != nil {
+			return err
+		}
+		activityJSON = string(b)
+	}
+	_, err := s.db.Exec(`UPDATE tasks SET activity=? WHERE project_id=? AND slug=?`,
+		activityJSON, projectID, slug)
+	return err
+}
+
 // ListTasks returns all tasks in a project (with deps), ordered by slug.
 func (s *Store) ListTasks(projectID string) ([]*Task, error) {
-	rows, err := s.db.Query(`SELECT id, project_id, feature_id, slug, title, prompt, status, branch, session_id, question, result, created_at, updated_at
+	rows, err := s.db.Query(`SELECT id, project_id, feature_id, slug, title, prompt, status, branch, session_id, question, result, activity, created_at, updated_at
 		FROM tasks WHERE project_id=? ORDER BY slug`, projectID)
 	if err != nil {
 		return nil, err
@@ -299,7 +335,7 @@ func (s *Store) ListTasks(projectID string) ([]*Task, error) {
 
 // GetTask fetches one task by slug within a project (nil if absent).
 func (s *Store) GetTask(projectID, slug string) (*Task, error) {
-	row := s.db.QueryRow(`SELECT id, project_id, feature_id, slug, title, prompt, status, branch, session_id, question, result, created_at, updated_at
+	row := s.db.QueryRow(`SELECT id, project_id, feature_id, slug, title, prompt, status, branch, session_id, question, result, activity, created_at, updated_at
 		FROM tasks WHERE project_id=? AND slug=?`, projectID, slug)
 	t, err := scanTask(row)
 	if err == sql.ErrNoRows {
@@ -426,7 +462,7 @@ func (s *Store) DeleteFeature(projectID, slug string) error {
 
 // TasksByFeature returns tasks with feature_id = featureID, ordered by slug, deps populated.
 func (s *Store) TasksByFeature(projectID, featureID string) ([]*Task, error) {
-	rows, err := s.db.Query(`SELECT id, project_id, feature_id, slug, title, prompt, status, branch, session_id, question, result, created_at, updated_at
+	rows, err := s.db.Query(`SELECT id, project_id, feature_id, slug, title, prompt, status, branch, session_id, question, result, activity, created_at, updated_at
 		FROM tasks WHERE project_id=? AND feature_id=? ORDER BY slug`, projectID, featureID)
 	if err != nil {
 		return nil, err
@@ -517,14 +553,17 @@ type scanner interface {
 
 func scanTask(sc scanner) (*Task, error) {
 	t := &Task{}
-	var status, created, updated string
+	var status, activityJSON, created, updated string
 	if err := sc.Scan(&t.ID, &t.ProjectID, &t.FeatureID, &t.Slug, &t.Title, &t.Prompt, &status,
-		&t.Branch, &t.SessionID, &t.Question, &t.Result, &created, &updated); err != nil {
+		&t.Branch, &t.SessionID, &t.Question, &t.Result, &activityJSON, &created, &updated); err != nil {
 		return nil, err
 	}
 	t.Status = Status(status)
 	t.CreatedAt, _ = time.Parse(time.RFC3339, created)
 	t.UpdatedAt, _ = time.Parse(time.RFC3339, updated)
+	if strings.TrimSpace(activityJSON) != "" {
+		_ = json.Unmarshal([]byte(activityJSON), &t.Activity) // best-effort; bad/empty JSON => nil
+	}
 	return t, nil
 }
 
