@@ -370,7 +370,14 @@ func TestStopBookkeeping(t *testing.T) {
 
 	// Register a worker + cancel func exactly as start would, so Stop has a live
 	// worker to terminate. The worker is never Started, so Close is a safe no-op.
+	// A real worktree is wired up (as Start would) so Stop's salvage-commit runs
+	// against it rather than the test process's cwd.
+	wt := h.addWorktree("stopme")
+	if err := os.WriteFile(filepath.Join(wt, "wip.txt"), []byte("partial\n"), 0o644); err != nil {
+		t.Fatalf("write wip.txt: %v", err)
+	}
 	w := worker.New(worker.Spec{ID: "stopme", RepoPath: h.repo})
+	w.Worktree = wt
 	canceled := false
 	cancel := func() { canceled = true }
 	h.r.mu.Lock()
@@ -396,6 +403,17 @@ func TestStopBookkeeping(t *testing.T) {
 	// Branch left intact for re-dispatch.
 	if tk.Branch != "rambl/stopme" {
 		t.Errorf("branch = %q, want it preserved as rambl/stopme", tk.Branch)
+	}
+	// Partial work was salvaged onto the branch and noted in the result.
+	if !strings.Contains(tk.Result, "partial work committed") {
+		t.Errorf("result %q should note salvaged work", tk.Result)
+	}
+	stat, _, derr := worker.DiffBranch(h.repo, "HEAD", "rambl/stopme")
+	if derr != nil {
+		t.Fatalf("DiffBranch: %v", derr)
+	}
+	if !strings.Contains(stat, "wip.txt") {
+		t.Errorf("branch diffstat %q should include the salvaged wip.txt", stat)
 	}
 
 	// The cancel func fired (unblocking start's w.Run).
@@ -1455,6 +1473,53 @@ func TestApplyClassifiesCrashAsFailed(t *testing.T) {
 	}
 	if strings.Contains(got.Result, "exited") || strings.Contains(got.Result, "no output") {
 		t.Fatalf("RAMBL_DONE: result %q was wrongly classified as a crash", got.Result)
+	}
+}
+
+// TestApplySalvagesTimedOutWork proves the salvage-commit path: when apply runs
+// with a timed-out turn and the worktree holds uncommitted changes, those changes
+// are committed to the task branch as a WIP commit (so partial work survives and
+// shows up in read_diff) and the result notes the salvage. The task is still
+// marked Failed.
+func TestApplySalvagesTimedOutWork(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+
+	h.addTask("timedout", nil)
+	h.mutate("timedout", func(tk *store.Task) { tk.Branch = "rambl/timedout" })
+	wt := h.addWorktree("timedout")
+
+	// Uncommitted work left behind by the worker when its turn timed out.
+	if err := os.WriteFile(filepath.Join(wt, "wip.txt"), []byte("partial progress\n"), 0o644); err != nil {
+		t.Fatalf("write wip.txt: %v", err)
+	}
+
+	w := worker.New(worker.Spec{ID: "timedout", RepoPath: h.repo})
+	w.Worktree = wt
+	h.r.apply(h.projectID, "timedout", w, worker.Turn{TimedOut: true})
+
+	// Task is failed, with a salvage note in the result.
+	got := h.get("timedout")
+	if got.Status != store.Failed {
+		t.Fatalf("status = %s, want failed", got.Status)
+	}
+	if !strings.Contains(got.Result, "partial work committed") {
+		t.Errorf("result %q should note salvaged work", got.Result)
+	}
+
+	// The branch gained a WIP commit carrying the partial work.
+	stat, _, err := worker.DiffBranch(h.repo, "HEAD", "rambl/timedout")
+	if err != nil {
+		t.Fatalf("DiffBranch: %v", err)
+	}
+	if !strings.Contains(stat, "wip.txt") {
+		t.Errorf("branch diffstat %q should include the salvaged wip.txt", stat)
+	}
+	subj := strings.TrimSpace(runGit(t, h.repo, "log", "-1", "--format=%s", "rambl/timedout"))
+	if !strings.Contains(subj, "WIP") || !strings.Contains(subj, "timed out") {
+		t.Errorf("WIP commit subject = %q, want it to mention WIP / timed out", subj)
 	}
 }
 

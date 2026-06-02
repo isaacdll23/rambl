@@ -20,10 +20,10 @@ import (
 
 // Payload is the subset of the Stop hook's stdin JSON we care about.
 type Payload struct {
-	SessionID     string `json:"session_id"`
-	HookEventName string `json:"hook_event_name"`
+	SessionID      string `json:"session_id"`
+	HookEventName  string `json:"hook_event_name"`
 	TranscriptPath string `json:"transcript_path"`
-	CWD           string `json:"cwd"`
+	CWD            string `json:"cwd"`
 }
 
 // Listener owns a unix socket and emits a Payload for every hook invocation.

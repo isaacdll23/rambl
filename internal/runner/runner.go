@@ -223,7 +223,11 @@ func (r *Runner) start(projectID, slug, prompt string, mergeRefs []string) {
 	}
 
 	if err != nil {
-		r.fail(projectID, slug, "run: "+err.Error())
+		msg := "run: " + err.Error()
+		if committed, summary, _ := w.SalvageCommit(fmt.Sprintf("rambl(%s): WIP — run error", slug)); committed {
+			msg += "\n\n— partial work committed; re-dispatch to resume.\n" + summary
+		}
+		r.fail(projectID, slug, msg)
 		return
 	}
 	r.apply(projectID, slug, w, turn)
@@ -721,6 +725,10 @@ func (r *Runner) Stop(projectID, slug string) error {
 		t.Status = store.Failed
 		t.Result = "⏹ stopped by PM before completion"
 		t.Question = ""
+		// Salvage partial work BEFORE cancel()/Close() so the git state is stable.
+		if committed, summary, _ := w.SalvageCommit(fmt.Sprintf("rambl(%s): WIP — stopped by PM", slug)); committed {
+			t.Result += "\n\n— partial work committed; re-dispatch to resume.\n" + summary
+		}
 		_ = r.store.Update(t)
 	}
 	if cancel != nil {
@@ -1110,6 +1118,9 @@ func (r *Runner) apply(projectID, slug string, w *worker.Worker, turn worker.Tur
 	if turn.TimedOut {
 		t.Status = store.Failed
 		t.Question = ""
+		if committed, summary, _ := w.SalvageCommit(fmt.Sprintf("rambl(%s): WIP — timed out", slug)); committed {
+			t.Result = strings.TrimSpace(t.Result) + fmt.Sprintf("\n\n— partial work committed; re-dispatch to resume.\n%s", summary)
+		}
 		_ = r.store.Update(t)
 		r.retire(slug)
 		return
@@ -1124,6 +1135,9 @@ func (r *Runner) apply(projectID, slug string, w *worker.Worker, turn worker.Tur
 		}
 		t.Result = "session exited before completing the turn: " + reason
 		t.Question = ""
+		if committed, summary, _ := w.SalvageCommit(fmt.Sprintf("rambl(%s): WIP — session exited mid-turn", slug)); committed {
+			t.Result = strings.TrimSpace(t.Result) + fmt.Sprintf("\n\n— partial work committed; re-dispatch to resume.\n%s", summary)
+		}
 		_ = r.store.Update(t)
 		r.retire(slug)
 		return
@@ -1134,6 +1148,9 @@ func (r *Runner) apply(projectID, slug string, w *worker.Worker, turn worker.Tur
 		t.Status = store.Failed
 		t.Result = "worker produced no output (the session may have crashed or never started its turn)"
 		t.Question = ""
+		if committed, summary, _ := w.SalvageCommit(fmt.Sprintf("rambl(%s): WIP — no output", slug)); committed {
+			t.Result = strings.TrimSpace(t.Result) + fmt.Sprintf("\n\n— partial work committed; re-dispatch to resume.\n%s", summary)
+		}
 		_ = r.store.Update(t)
 		r.retire(slug)
 		return
