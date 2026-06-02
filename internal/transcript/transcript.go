@@ -34,6 +34,13 @@ type line struct {
 	} `json:"message"`
 }
 
+// Activity is one compact record of a tool the worker invoked in its session.
+type Activity struct {
+	Kind   string // "tool" or "text" (currently always "tool")
+	Tool   string // tool name, e.g. "Edit", "Bash", "Read"
+	Detail string // compact arg summary (file path, command, pattern), may be ""
+}
+
 // Tailer watches a working dir's transcript directory, detects the new session
 // file created after it was constructed, and tracks the latest state.
 type Tailer struct {
@@ -45,6 +52,7 @@ type Tailer struct {
 	lastAssistant  string
 	lastDurationMs int
 	file           string
+	recent         []Activity
 }
 
 // NewTailer snapshots the existing transcript files so Run can identify the
@@ -91,6 +99,12 @@ func (t *Tailer) Run(ctx context.Context) {
 				if txt := extractText(l.Message.Content); txt != "" {
 					t.lastAssistant = txt
 				}
+				for _, a := range extractActivities(l.Message.Content) {
+					t.recent = append(t.recent, a)
+					if len(t.recent) > 12 {
+						t.recent = t.recent[len(t.recent)-12:]
+					}
+				}
 			}
 			if l.Type == "system" && l.DurationMs != nil {
 				t.lastDurationMs = *l.DurationMs
@@ -107,6 +121,18 @@ func (t *Tailer) Latest() (sessionID, assistant string, durationMs int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.sessionID, t.lastAssistant, t.lastDurationMs
+}
+
+// Recent returns a copy of the rolling tool-activity ring, oldest first.
+func (t *Tailer) Recent() []Activity {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.recent) == 0 {
+		return nil
+	}
+	out := make([]Activity, len(t.recent))
+	copy(out, t.recent)
+	return out
 }
 
 func (t *Tailer) currentFile() string { t.mu.Lock(); defer t.mu.Unlock(); return t.file }
@@ -182,4 +208,76 @@ func extractText(raw json.RawMessage) string {
 		return sb.String()
 	}
 	return ""
+}
+
+// extractActivities pulls tool_use blocks out of an assistant content payload.
+// Plain-string content (no blocks) yields no activities.
+func extractActivities(raw json.RawMessage) []Activity {
+	if len(raw) == 0 {
+		return nil
+	}
+	var blocks []struct {
+		Type  string          `json:"type"`
+		Name  string          `json:"name"`
+		Input json.RawMessage `json:"input"`
+		Text  string          `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) != nil {
+		return nil
+	}
+	var out []Activity
+	for _, b := range blocks {
+		if b.Type == "tool_use" {
+			out = append(out, Activity{
+				Kind:   "tool",
+				Tool:   b.Name,
+				Detail: summarizeToolInput(b.Name, b.Input),
+			})
+		}
+	}
+	return out
+}
+
+// summarizeToolInput renders a tool's input as a compact one-line detail.
+func summarizeToolInput(name string, input json.RawMessage) string {
+	if len(input) == 0 {
+		return ""
+	}
+	var field string
+	switch name {
+	case "Bash":
+		field = "command"
+	case "Edit", "Write", "Read", "NotebookEdit":
+		field = "file_path"
+	case "Grep", "Glob":
+		field = "pattern"
+	case "Task":
+		field = "description"
+	case "WebFetch":
+		field = "url"
+	case "WebSearch":
+		field = "query"
+	default:
+		return ""
+	}
+	var m map[string]any
+	if json.Unmarshal(input, &m) != nil {
+		return ""
+	}
+	v, _ := m[field].(string)
+	return compactDetail(v)
+}
+
+// compactDetail collapses whitespace to single spaces, trims, and truncates to
+// at most 100 runes (appending "…" when truncated).
+func compactDetail(s string) string {
+	s = strings.TrimSpace(strings.Join(strings.Fields(s), " "))
+	if s == "" {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) > 100 {
+		return string(r[:100]) + "…"
+	}
+	return s
 }

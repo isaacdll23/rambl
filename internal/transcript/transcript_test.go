@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -152,6 +153,152 @@ func TestTailerRunTracksLatest(t *testing.T) {
 	}
 
 	cancel()
+}
+
+func TestTailerRunTracksRecentActivities(t *testing.T) {
+	tmp := t.TempDir()
+	tl := &Tailer{dir: tmp, before: map[string]bool{}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tl.Run(ctx)
+	}()
+	t.Cleanup(wg.Wait)
+
+	time.Sleep(50 * time.Millisecond)
+	content := `{"type":"assistant","sessionId":"s1","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"go test ./..."}}]}}` + "\n" +
+		`{"type":"assistant","sessionId":"s1","message":{"content":[{"type":"text","text":"working"},{"type":"tool_use","name":"Edit","input":{"file_path":"/tmp/x.go"}}]}}` + "\n" +
+		`{"type":"assistant","sessionId":"s1","message":{"content":[{"type":"tool_use","name":"Grep","input":{"pattern":"func main"}}]}}` + "\n"
+	if err := os.WriteFile(filepath.Join(tmp, "sess.jsonl"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var recent []Activity
+	for time.Now().Before(deadline) {
+		recent = tl.Recent()
+		if len(recent) == 3 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	want := []Activity{
+		{Kind: "tool", Tool: "Bash", Detail: "go test ./..."},
+		{Kind: "tool", Tool: "Edit", Detail: "/tmp/x.go"},
+		{Kind: "tool", Tool: "Grep", Detail: "func main"},
+	}
+	if len(recent) != len(want) {
+		t.Fatalf("Recent() len = %d, want %d (%+v)", len(recent), len(want), recent)
+	}
+	for i := range want {
+		if recent[i] != want[i] {
+			t.Errorf("Recent()[%d] = %+v, want %+v", i, recent[i], want[i])
+		}
+	}
+
+	cancel()
+}
+
+func TestTailerRecentRingCaps(t *testing.T) {
+	tmp := t.TempDir()
+	tl := &Tailer{dir: tmp, before: map[string]bool{}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tl.Run(ctx)
+	}()
+	t.Cleanup(wg.Wait)
+
+	time.Sleep(50 * time.Millisecond)
+	// Build content with distinct, recoverable file paths per line.
+	var content strings.Builder
+	for i := 0; i < 15; i++ {
+		content.WriteString(`{"type":"assistant","sessionId":"s1","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/f/` + strconv.Itoa(i) + `"}}]}}` + "\n")
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "sess.jsonl"), []byte(content.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var recent []Activity
+	for time.Now().Before(deadline) {
+		recent = tl.Recent()
+		if len(recent) == 12 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if len(recent) != 12 {
+		t.Fatalf("Recent() len = %d, want 12", len(recent))
+	}
+	// Should keep the LAST 12: indices 3..14.
+	for i, a := range recent {
+		want := "/f/" + strconv.Itoa(i+3)
+		if a.Detail != want {
+			t.Errorf("Recent()[%d].Detail = %q, want %q", i, a.Detail, want)
+		}
+	}
+
+	cancel()
+}
+
+func TestSummarizeToolInput(t *testing.T) {
+	tests := []struct {
+		name  string
+		tool  string
+		input string
+		want  string
+	}{
+		{"bash command", "Bash", `{"command":"go build ./..."}`, "go build ./..."},
+		{"edit file_path", "Edit", `{"file_path":"/a/b.go"}`, "/a/b.go"},
+		{"write file_path", "Write", `{"file_path":"/a/c.go"}`, "/a/c.go"},
+		{"read file_path", "Read", `{"file_path":"/a/d.go"}`, "/a/d.go"},
+		{"notebookedit file_path", "NotebookEdit", `{"file_path":"/a/e.ipynb"}`, "/a/e.ipynb"},
+		{"grep pattern", "Grep", `{"pattern":"func main"}`, "func main"},
+		{"glob pattern", "Glob", `{"pattern":"**/*.go"}`, "**/*.go"},
+		{"task description", "Task", `{"description":"do the thing"}`, "do the thing"},
+		{"webfetch url", "WebFetch", `{"url":"https://example.com"}`, "https://example.com"},
+		{"websearch query", "WebSearch", `{"query":"golang json"}`, "golang json"},
+		{"unmapped default", "MysteryTool", `{"command":"whatever"}`, ""},
+		{"missing field", "Bash", `{"foo":"bar"}`, ""},
+		{"empty field", "Bash", `{"command":""}`, ""},
+		{"empty input", "Bash", ``, ""},
+		{"collapses whitespace", "Bash", `{"command":"a\n\tb   c"}`, "a b c"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := summarizeToolInput(tt.tool, json.RawMessage(tt.input)); got != tt.want {
+				t.Fatalf("summarizeToolInput(%q, %q) = %q, want %q", tt.tool, tt.input, got, tt.want)
+			}
+		})
+	}
+
+	// Truncation to 100 runes with ellipsis.
+	long := strings.Repeat("x", 250)
+	input := json.RawMessage(`{"command":"` + long + `"}`)
+	got := summarizeToolInput("Bash", input)
+	gotRunes := []rune(got)
+	if len(gotRunes) != 101 { // 100 runes + the "…"
+		t.Fatalf("truncated length = %d runes, want 101", len(gotRunes))
+	}
+	if gotRunes[100] != '…' {
+		t.Fatalf("truncated detail must end with '…', got %q", string(gotRunes[100]))
+	}
+	if string(gotRunes[:100]) != strings.Repeat("x", 100) {
+		t.Fatalf("truncated prefix = %q, want 100 x's", string(gotRunes[:100]))
+	}
 }
 
 func equalStrings(a, b []string) bool {
