@@ -376,13 +376,14 @@ func settledOrNeedsAttention(st *store.Store, projectID, slug string) bool {
 
 // taskView is the compact per-task shape returned to the PM.
 type taskView struct {
-	Slug     string   `json:"slug"`
-	Title    string   `json:"title"`
-	Status   string   `json:"status"`
-	Deps     []string `json:"deps,omitempty"`
-	Branch   string   `json:"branch,omitempty"`
-	Question string   `json:"question,omitempty"`
-	Result   string   `json:"result,omitempty"`
+	Slug     string           `json:"slug"`
+	Title    string           `json:"title"`
+	Status   string           `json:"status"`
+	Deps     []string         `json:"deps,omitempty"`
+	Branch   string           `json:"branch,omitempty"`
+	Question string           `json:"question,omitempty"`
+	Result   string           `json:"result,omitempty"`
+	Activity []store.Activity `json:"activity,omitempty"`
 }
 
 func tasksJSON(st *store.Store, projectID, slug string) (*mcp.CallToolResult, error) {
@@ -406,7 +407,7 @@ func tasksJSON(st *store.Store, projectID, slug string) (*mcp.CallToolResult, er
 	for _, t := range tasks {
 		views = append(views, taskView{
 			Slug: t.Slug, Title: t.Title, Status: string(t.Status), Deps: t.Deps,
-			Branch: t.Branch, Question: t.Question, Result: t.Result,
+			Branch: t.Branch, Question: t.Question, Result: t.Result, Activity: t.Activity,
 		})
 	}
 	data, _ := json.MarshalIndent(views, "", "  ")
@@ -450,7 +451,7 @@ func featuresJSON(st *store.Store, projectID, slug string) (*mcp.CallToolResult,
 		for _, t := range tasks {
 			taskViews = append(taskViews, taskView{
 				Slug: t.Slug, Title: t.Title, Status: string(t.Status), Deps: t.Deps,
-				Branch: t.Branch, Question: t.Question, Result: t.Result,
+				Branch: t.Branch, Question: t.Question, Result: t.Result, Activity: t.Activity,
 			})
 		}
 		views = append(views, featureView{
