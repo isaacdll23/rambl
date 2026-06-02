@@ -47,3 +47,55 @@ func TestStartAcceptsTrustDialog(t *testing.T) {
 		t.Fatalf("Start took %s — suspiciously close to the trust-dialog timeout", elapsed)
 	}
 }
+
+// TestAccessorsZeroValueSafe asserts the diagnostic accessors never panic on a
+// zero-value session (one that never made it past construction).
+func TestAccessorsZeroValueSafe(t *testing.T) {
+	var s Session
+	if got := s.Tail(); got != "" {
+		t.Fatalf("Tail() on zero value = %q, want empty", got)
+	}
+	if err := s.ExitErr(); err != nil {
+		t.Fatalf("ExitErr() on zero value = %v, want nil", err)
+	}
+	if ch := s.Exited(); ch != nil {
+		t.Fatalf("Exited() on zero value = %v, want nil", ch)
+	}
+}
+
+// TestAccessorsPartialSession asserts the accessors are safe on a
+// partially-constructed session (exited channel present but no process).
+func TestAccessorsPartialSession(t *testing.T) {
+	s := &Session{exited: make(chan struct{})}
+	if got := s.Tail(); got != "" {
+		t.Fatalf("Tail() = %q, want empty", got)
+	}
+	if err := s.ExitErr(); err != nil {
+		t.Fatalf("ExitErr() = %v, want nil", err)
+	}
+	// Close on a session with no cmd/ptmx must not panic.
+	go func() { s.setExit(nil) }()
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close() on partial session = %v, want nil", err)
+	}
+}
+
+// TestTailTruncates verifies Tail() returns only the last 2000 bytes of a
+// directly-populated tailBuf (same-package test reaches the unexported field).
+func TestTailTruncates(t *testing.T) {
+	s := &Session{}
+	s.tailBuf = make([]byte, 5000)
+	for i := range s.tailBuf {
+		s.tailBuf[i] = 'x'
+	}
+	// Mark the final byte so we can confirm we got the tail, not the head.
+	s.tailBuf[len(s.tailBuf)-1] = 'Z'
+
+	got := s.Tail()
+	if len(got) != 2000 {
+		t.Fatalf("Tail() len = %d, want 2000", len(got))
+	}
+	if got[len(got)-1] != 'Z' {
+		t.Fatalf("Tail() did not return the most recent bytes")
+	}
+}

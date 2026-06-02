@@ -44,6 +44,27 @@ type Config struct {
 type Session struct {
 	cmd  *exec.Cmd
 	ptmx *os.File
+
+	// exited is closed exactly once when the underlying process exits.
+	exited   chan struct{}
+	exitOnce sync.Once
+	exitErr  error
+
+	// mu guards tailBuf and exitErr. tailBuf is a rolling tail of stripped PTY
+	// output kept for diagnostics, independent of readLoop's local acc and never
+	// cleared by the dialog handlers.
+	mu      sync.Mutex
+	tailBuf []byte
+}
+
+// setExit records the process exit error and closes s.exited, idempotently.
+func (s *Session) setExit(err error) {
+	s.exitOnce.Do(func() {
+		s.mu.Lock()
+		s.exitErr = err
+		s.mu.Unlock()
+		close(s.exited)
+	})
 }
 
 // ResolveClaude finds the claude binary: CLAUDE_PATH → PATH → native installer → brew.
@@ -92,7 +113,15 @@ func Start(cfg Config) (*Session, error) {
 		return nil, fmt.Errorf("pty start: %w", err)
 	}
 	_ = pty.Setsize(ptmx, &pty.Winsize{Rows: 40, Cols: 120})
-	s := &Session{cmd: cmd, ptmx: ptmx}
+	s := &Session{cmd: cmd, ptmx: ptmx, exited: make(chan struct{})}
+
+	// Watch the process: a single background Wait closes s.exited when claude
+	// exits, so callers can react to a crash/exit instead of blocking the full
+	// turn timeout. This is the ONLY caller of cmd.Wait (see Close).
+	go func() {
+		err := cmd.Wait()
+		s.setExit(err)
+	}()
 
 	// One long-lived reader drains the PTY (so claude never blocks on a full
 	// output buffer), accepts the bypass acknowledgment screen IF it appears,
@@ -107,9 +136,12 @@ func Start(cfg Config) (*Session, error) {
 	select {
 	case <-ready:
 		time.Sleep(settle) // let the input box finish rendering
+	case <-s.exited:
+		_ = s.Close()
+		return nil, fmt.Errorf("claude exited during startup (%v); last output:\n%s", s.ExitErr(), s.Tail())
 	case <-time.After(45 * time.Second):
 		_ = s.Close()
-		return nil, fmt.Errorf("REPL did not become ready (no input prompt within 45s)")
+		return nil, fmt.Errorf("REPL did not become ready (no input prompt within 45s); last output:\n%s", s.Tail())
 	}
 	return s, nil
 }
@@ -128,7 +160,17 @@ func (s *Session) readLoop(ready chan struct{}, acceptBypass bool, logw io.Write
 			if logw != nil {
 				_, _ = logw.Write(buf[:n])
 			}
-			acc = append(acc, stripANSI(buf[:n])...)
+			stripped := stripANSI(buf[:n])
+			// Keep a rolling tail of stripped output for diagnostics. This is
+			// unconditional and independent of the acc resets below, so the tail
+			// always reflects the most recent output regardless of dialog state.
+			s.mu.Lock()
+			s.tailBuf = append(s.tailBuf, stripped...)
+			if len(s.tailBuf) > 4096 {
+				s.tailBuf = s.tailBuf[len(s.tailBuf)-4096:]
+			}
+			s.mu.Unlock()
+			acc = append(acc, stripped...)
 			if len(acc) > 32768 {
 				acc = acc[len(acc)-32768:]
 			}
@@ -185,7 +227,10 @@ func (s *Session) Send(text string) error {
 	return nil
 }
 
-// Close exits the session (Ctrl-C twice, then hard kill as a fallback).
+// Close exits the session (Ctrl-C twice, then hard kill as a fallback). It does
+// NOT call Process.Wait directly — the background goroutine in Start owns the
+// single cmd.Wait — instead it waits (briefly) for that goroutine to observe
+// the exit via s.exited before closing the ptmx.
 func (s *Session) Close() error {
 	if s.ptmx != nil {
 		_, _ = s.ptmx.Write([]byte("\x03\x03"))
@@ -193,12 +238,41 @@ func (s *Session) Close() error {
 	}
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
-		_, _ = s.cmd.Process.Wait()
+	}
+	// Wait for the exit goroutine to reap the process, but don't block forever
+	// (Close may run on a partially-constructed session with no goroutine).
+	if s.exited != nil {
+		select {
+		case <-s.exited:
+		case <-time.After(2 * time.Second):
+		}
 	}
 	if s.ptmx != nil {
 		return s.ptmx.Close()
 	}
 	return nil
+}
+
+// Exited returns a channel closed when the claude process exits. After it is
+// closed, ExitErr returns the exit error (nil if the process exited 0).
+func (s *Session) Exited() <-chan struct{} { return s.exited }
+
+// ExitErr returns the process exit error once Exited() is closed (nil before).
+func (s *Session) ExitErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.exitErr
+}
+
+// Tail returns the last ~2000 chars of stripped PTY output, for diagnostics.
+func (s *Session) Tail() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := s.tailBuf
+	if len(b) > 2000 {
+		b = b[len(b)-2000:]
+	}
+	return string(b)
 }
 
 // Env returns the current environment minus credential keys (forcing
