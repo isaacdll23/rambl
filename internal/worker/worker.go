@@ -214,6 +214,30 @@ func (w *Worker) Commit(message string) error {
 	return nil
 }
 
+// SalvageCommit stages and commits all current worktree changes to the branch
+// as a WIP commit, so partial progress survives a non-success exit. It returns
+// committed=false with a nil error when there is nothing to commit. summary is a
+// short human-readable diffstat of what was salvaged (empty when committed is false).
+func (w *Worker) SalvageCommit(message string) (committed bool, summary string, err error) {
+	// No worktree → nothing to salvage. Guards against running git in the
+	// process's cwd when Worktree was never set.
+	if w.Worktree == "" {
+		return false, "", nil
+	}
+	summary, _ = w.Changes() // best-effort; ignore error for the summary
+	if _, err := gitID(w.Worktree, "add", "-A"); err != nil {
+		return false, "", err
+	}
+	// Nothing staged → no commit, and no salvage summary to report.
+	if _, err := gitID(w.Worktree, "diff", "--cached", "--quiet"); err == nil {
+		return false, "", nil
+	}
+	if out, err := gitID(w.Worktree, "commit", "-m", message); err != nil {
+		return false, "", fmt.Errorf("commit: %v: %s", err, out)
+	}
+	return true, summary, nil
+}
+
 // Run executes the spec's first prompt and returns the resulting turn.
 func (w *Worker) Run(ctx context.Context) (Turn, error) {
 	return w.Send(ctx, w.Spec.Prompt)

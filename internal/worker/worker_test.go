@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -444,6 +445,73 @@ func commitBranch(t *testing.T, repo, branch, file, content string) {
 	}
 	if out, err := gitID(repo, "worktree", "remove", "--force", wt); err != nil {
 		t.Fatalf("worktree remove: %v: %s", err, out)
+	}
+}
+
+// TestSalvageCommit covers both arms of SalvageCommit: a dirty worktree yields
+// committed=true plus a new WIP commit on the branch, and a clean worktree
+// yields committed=false with no new commit.
+func TestSalvageCommit(t *testing.T) {
+	repo := newRepo(t)
+
+	countCommits := func() int {
+		t.Helper()
+		out, err := gitID(repo, "rev-list", "--count", "HEAD")
+		if err != nil {
+			t.Fatalf("rev-list: %v: %s", err, out)
+		}
+		var n int
+		if _, err := fmt.Sscanf(strings.TrimSpace(out), "%d", &n); err != nil {
+			t.Fatalf("parse count %q: %v", out, err)
+		}
+		return n
+	}
+
+	w := &Worker{Worktree: repo}
+
+	// (a) Dirty worktree: a new (untracked) file plus a modification → one commit.
+	before := countCommits()
+	if err := os.WriteFile(filepath.Join(repo, "new.txt"), []byte("salvage me\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	committed, summary, err := w.SalvageCommit("rambl(x): WIP — timed out")
+	if err != nil {
+		t.Fatalf("SalvageCommit (dirty): %v", err)
+	}
+	if !committed {
+		t.Fatalf("SalvageCommit (dirty) committed = false, want true")
+	}
+	if strings.TrimSpace(summary) == "" {
+		t.Errorf("SalvageCommit (dirty) summary should be non-empty")
+	}
+	if !strings.Contains(summary, "new.txt") {
+		t.Errorf("summary should mention new.txt, got %q", summary)
+	}
+	if got := countCommits(); got != before+1 {
+		t.Errorf("commit count = %d, want %d (exactly one new commit)", got, before+1)
+	}
+	out, err := gitID(repo, "log", "-1", "--format=%s")
+	if err != nil {
+		t.Fatalf("log: %v: %s", err, out)
+	}
+	if strings.TrimSpace(out) != "rambl(x): WIP — timed out" {
+		t.Errorf("commit subject = %q, want %q", strings.TrimSpace(out), "rambl(x): WIP — timed out")
+	}
+
+	// (b) Clean worktree (the salvage above committed everything): no new commit.
+	before = countCommits()
+	committed, summary, err = w.SalvageCommit("rambl(x): WIP — nothing")
+	if err != nil {
+		t.Fatalf("SalvageCommit (clean): %v", err)
+	}
+	if committed {
+		t.Errorf("SalvageCommit (clean) committed = true, want false")
+	}
+	if summary != "" {
+		t.Errorf("SalvageCommit (clean) summary = %q, want empty", summary)
+	}
+	if got := countCommits(); got != before {
+		t.Errorf("commit count = %d, want %d (no new commit)", got, before)
 	}
 }
 
