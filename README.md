@@ -5,10 +5,12 @@ driven by a product-manager agent you talk to.
 
 `rambl` launches one persistent environment: an interactive PM session (a real
 Claude Code session, so it uses your subscription — not API billing) that plans
-your work, dispatches autonomous coding workers, monitors them, and answers
-their questions. Each worker runs in its own git worktree; their results land on
-`rambl/<task>` branches for you to review. A separate read-only TUI lets you
-watch them.
+your work, dispatches autonomous coding workers, monitors them, answers their
+questions, reviews their diffs, and — when you want — opens GitHub PRs. Each
+worker runs in its own git worktree; their results land on `rambl/<task>`
+branches for you to review. Related tasks can be grouped into a **feature** that
+lands as a single PR (see [Features](#features)). A separate read-only TUI lets
+you watch them.
 
 > Early and experimental. Workers run autonomously with permissions disabled,
 > contained to their git worktree — point it at repos where that's acceptable.
@@ -20,7 +22,7 @@ you ⇄ rambl  (one environment process)
         ├─ SQLite state            (~/.rambl/state.db)
         ├─ MCP server (HTTP)       the PM's tools
         └─ PM = interactive Claude (your subscription), wired to those tools:
-              plan → dispatch → monitor → resolve blockers → report
+              plan → dispatch → monitor → resolve blockers → review → open PR
                 └─ workers: autonomous Claude Code sessions, one git worktree each
 ```
 
@@ -91,16 +93,41 @@ git log --oneline --all
 git diff main..rambl/<task>
 ```
 
+The PM reviews and verifies each worker's diff before surfacing it as done, and
+can open a GitHub PR for you on request. Nothing is pushed until you ask for a
+PR.
+
+### Features
+
+A **feature** is a named group of related tasks that land together as a single
+pull request, instead of one PR per task. The PM creates the feature, attaches
+tasks to it with the right dependencies, then runs it end-to-end: ready tasks
+dispatch in parallel, each completed task is squash-merged into a
+`rambl/feat/<slug>` branch in dependency order, an integration gate keeps that
+branch building/passing, and once everything is merged and green the feat→main
+PR is opened automatically. Use a feature when several interdependent tasks
+should ship as one reviewable unit; use a standalone task for isolated one-offs.
+
 ### Commands
 
 | command | what it does |
 |---|---|
 | `rambl` | launch the PM in the current repo, or pick one from a TUI if you're not in a repo |
 | `rambl pick` | choose a repo from a TUI, then launch the PM environment |
-| `rambl pm -repo <path> [-model <m>]` | explicit environment launch |
-| `rambl monitor -repo <path> [--once]` | read-only worker dashboard |
-| `rambl env-once -repo <path> -brief <text>` | drive the PM through one brief (non-interactive) |
+| `rambl pm -repo <path> [-db <p>] [-base <ref>] [-model <m>]` | explicit environment launch |
+| `rambl monitor -repo <path> [-db <p>] [--once]` | read-only worker dashboard (`--once` prints a snapshot and exits) |
+| `rambl env-once -repo <path> -brief <text> [-base <ref>] [-timeout <dur>]` | drive the PM through one brief (non-interactive) |
+| `rambl doctor` | preflight check: `claude` and `git` on `PATH`, `~/.rambl` writable |
+| `rambl config [list\|get\|set\|path] [<key>] [<val>]` | view or change settings in `~/.rambl/config.json` |
 | `rambl version` | print version, commit, and build date |
+
+#### Settings
+
+`rambl config` reads and writes `~/.rambl/config.json`. Current keys:
+
+| key | default | what it does |
+|---|---|---|
+| `turn-timeout` | `15m` | per-turn wall-clock cap for a worker's Claude session (also settable via `RAMBL_TURN_TIMEOUT`) |
 
 ### Tailoring the PM
 
@@ -135,4 +162,6 @@ the Woodpecker repo.
   rate-limit backoff lands.
 - Containment is the git worktree by convention — workers can still run
   arbitrary tools. Use accordingly.
-- Nothing is pushed for you; your working tree and `main` are never touched.
+- Your working tree and `main` are never touched. Branches stay local until you
+  ask the PM to open a PR (or an auto-opened feature PR), which pushes that one
+  `rambl/<task>` or `rambl/feat/<slug>` branch to `origin`.
