@@ -1523,6 +1523,77 @@ func TestApplySalvagesTimedOutWork(t *testing.T) {
 	}
 }
 
+// TestShouldResume covers the re-dispatch RESUME decision in isolation. Driving a
+// true end-to-end resume is impractical here (start() spawns a real Claude session
+// via w.Start, which the hermetic harness cannot provide — selfExe==""), so we
+// unit-test the extracted decision helper, which is what start() branches on. It
+// must be true only when the branch exists, has a salvage commit beyond base, AND
+// the worktree dir is still on disk; any one missing → fresh run.
+func TestShouldResume(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	h := newHarness(t)
+
+	// (a) Branch with a salvage commit beyond base + worktree present -> resume.
+	h.addTask("resume-ok", nil)
+	wt := h.addWorktree("resume-ok")
+	if err := os.WriteFile(filepath.Join(wt, "wip.txt"), []byte("partial\n"), 0o644); err != nil {
+		t.Fatalf("write wip.txt: %v", err)
+	}
+	runGit(t, wt, "add", "-A")
+	runGit(t, wt, "commit", "-m", "rambl(resume-ok): WIP — salvaged")
+	h.mutate("resume-ok", func(tk *store.Task) {
+		tk.Status = store.Failed
+		tk.Branch = "rambl/resume-ok"
+	})
+	// The salvage commit's hash, to prove it stays reachable (not wiped).
+	salvageHash := strings.TrimSpace(runGit(t, h.repo, "rev-parse", "rambl/resume-ok"))
+	if resume, branch := h.r.shouldResume(h.projectID, h.get("resume-ok")); !resume {
+		t.Errorf("branch-with-commits+worktree: resume = false, want true")
+	} else if branch != "rambl/resume-ok" {
+		t.Errorf("branch = %q, want rambl/resume-ok", branch)
+	}
+	// Sanity: the salvage commit is the branch tip and an ancestor of itself —
+	// i.e. resuming would build on it, never recreate the branch.
+	if got := strings.TrimSpace(runGit(t, h.repo, "rev-parse", "rambl/resume-ok")); got != salvageHash {
+		t.Errorf("salvage commit %s no longer the branch tip (%s)", salvageHash, got)
+	}
+
+	// (b) No branch at all -> fresh.
+	h.addTask("resume-nobranch", nil)
+	h.mutate("resume-nobranch", func(tk *store.Task) { tk.Status = store.Failed })
+	if resume, _ := h.r.shouldResume(h.projectID, h.get("resume-nobranch")); resume {
+		t.Errorf("no branch: resume = true, want false")
+	}
+
+	// (c) Branch exists + worktree present but NO commits beyond base -> fresh.
+	h.addTask("resume-nochange", nil)
+	h.addWorktree("resume-nochange")
+	h.mutate("resume-nochange", func(tk *store.Task) {
+		tk.Status = store.Failed
+		tk.Branch = "rambl/resume-nochange"
+	})
+	if resume, _ := h.r.shouldResume(h.projectID, h.get("resume-nochange")); resume {
+		t.Errorf("branch with no commits beyond base: resume = true, want false")
+	}
+
+	// (d) Branch with commits beyond base but worktree dir gone -> fresh.
+	// commitTaskBranch builds rambl/<slug> with a commit, then removes the worktree.
+	h.addTask("resume-nowt", nil)
+	h.commitTaskBranch("resume-nowt", "f.txt", "f\n")
+	h.mutate("resume-nowt", func(tk *store.Task) {
+		tk.Status = store.Failed
+		tk.Branch = "rambl/resume-nowt"
+	})
+	if _, err := os.Stat(h.r.taskWorktree(h.projectID, "resume-nowt")); !os.IsNotExist(err) {
+		t.Fatalf("precondition: worktree for resume-nowt should be absent, stat err = %v", err)
+	}
+	if resume, _ := h.r.shouldResume(h.projectID, h.get("resume-nowt")); resume {
+		t.Errorf("worktree missing: resume = true, want false")
+	}
+}
+
 // Dispatch must mark the task starting (not running): liveness is only claimed
 // once the REPL is live, which start() does after w.Start succeeds.
 func TestDispatchSetsStarting(t *testing.T) {

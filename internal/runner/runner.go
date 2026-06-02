@@ -183,12 +183,30 @@ func (r *Runner) start(projectID, slug, prompt string, mergeRefs []string) {
 		r.fail(projectID, slug, "start: "+err.Error())
 		return
 	}
-	spec := worker.Spec{
-		ID: slug, Prompt: prompt, RepoPath: r.repoPath, Base: base,
-		MergeRefs: mergeRefs, SystemPrompt: WorkerSystemPrompt,
-	}
-	if r.worktreeBase != "" {
-		spec.Worktree = filepath.Join(r.worktreeBase, projectID, slug)
+
+	// Decide RESUME vs FRESH purely from branch state, so any re-dispatch path
+	// (standalone or feature-engine, both via Dispatch) resumes a task whose
+	// prior run left a salvage commit instead of wiping it and restarting.
+	resume, branch := r.shouldResume(projectID, t)
+
+	var spec worker.Spec
+	if resume {
+		// Reopen the existing worktree+branch: this preserves the salvage commit
+		// and any dependency merges already applied on the first dispatch (so we
+		// deliberately do NOT pass MergeRefs here).
+		spec = worker.Spec{
+			ID: slug, RepoPath: r.repoPath, Base: base,
+			Branch: branch, Reopen: true, SystemPrompt: WorkerSystemPrompt,
+			Worktree: r.taskWorktree(projectID, slug),
+		}
+	} else {
+		spec = worker.Spec{
+			ID: slug, Prompt: prompt, RepoPath: r.repoPath, Base: base,
+			MergeRefs: mergeRefs, SystemPrompt: WorkerSystemPrompt,
+		}
+		if r.worktreeBase != "" {
+			spec.Worktree = filepath.Join(r.worktreeBase, projectID, slug)
+		}
 	}
 	w := worker.New(spec)
 	w.TurnTimeout = r.turnTimeout
@@ -211,7 +229,16 @@ func (r *Runner) start(projectID, slug, prompt string, mergeRefs []string) {
 		_ = r.store.Update(t2)
 	}
 
-	turn, err := r.withHeartbeat(projectID, slug, w, func() (worker.Turn, error) { return w.Run(runCtx) })
+	turn, err := r.withHeartbeat(projectID, slug, w, func() (worker.Turn, error) {
+		if resume {
+			// Send a self-contained continuation (NOT w.Run, which would re-send
+			// the original first-turn prompt) so the worker builds on its salvage
+			// commit and finishes the remaining work.
+			stat, _, _ := worker.DiffBranch(r.repoPath, base, branch)
+			return w.Send(runCtx, resumePrompt(prompt, stat))
+		}
+		return w.Run(runCtx)
+	})
 
 	// If we were retired out from under us (by Stop or Delete) while blocked in
 	// Run, the terminal status is already set — bow out without clobbering it.
@@ -231,6 +258,58 @@ func (r *Runner) start(projectID, slug, prompt string, mergeRefs []string) {
 		return
 	}
 	r.apply(projectID, slug, w, turn)
+}
+
+// taskWorktree returns the on-disk worktree path for a task, matching how start
+// computes spec.Worktree (and worker.Worker.Start's own default when no worktree
+// base is configured), so resume reopens the same directory the first run used.
+func (r *Runner) taskWorktree(projectID, slug string) string {
+	if r.worktreeBase != "" {
+		return filepath.Join(r.worktreeBase, projectID, slug)
+	}
+	return filepath.Join(r.repoPath, ".rambl", "worktrees", slug)
+}
+
+// shouldResume decides whether a (re-)dispatch of t should RESUME on its existing
+// branch rather than start fresh. It returns true, along with the resolved branch
+// name, only when ALL hold: the branch exists, it has commits beyond its base (a
+// salvage/WIP commit from a prior run), and its worktree directory is still present
+// on disk. On any failure to resolve the base it returns (false, "").
+func (r *Runner) shouldResume(projectID string, t *store.Task) (bool, string) {
+	base, err := r.taskBase(projectID, t)
+	if err != nil {
+		return false, ""
+	}
+	branch := t.Branch
+	if branch == "" {
+		branch = "rambl/" + t.Slug
+	}
+	if !worker.BranchExists(r.repoPath, branch) {
+		return false, branch
+	}
+	stat, _, err := worker.DiffBranch(r.repoPath, base, branch)
+	if err != nil || strings.TrimSpace(stat) == "" {
+		return false, branch
+	}
+	if _, err := os.Stat(r.taskWorktree(projectID, t.Slug)); err != nil {
+		return false, branch
+	}
+	return true, branch
+}
+
+// resumePrompt builds the self-contained continuation prompt sent to a resumed
+// worker: it restates the original task, summarises the work already committed,
+// and re-establishes the DONE/BLOCKED outcome protocol.
+func resumePrompt(originalTask, stat string) string {
+	return fmt.Sprintf(`You previously worked on this task in this worktree and stopped before finishing. Your partial work is already committed here; continue from the current state and finish.
+
+Original task:
+%s
+
+Work completed so far (diff stat vs base):
+%s
+
+Continue and complete the task. End with RAMBL_DONE when fully done, or RAMBL_BLOCKED: <question> if you cannot proceed.`, originalTask, stat)
 }
 
 // withHeartbeat runs fn (a turn) while flushing w.Activity() to the store every
