@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"rambl/internal/store"
+	"rambl/internal/transcript"
 	"rambl/internal/worker"
 )
 
@@ -1384,4 +1385,94 @@ func TestTopoOrder(t *testing.T) {
 	if _, err := TopoOrder(cycle); err == nil {
 		t.Errorf("expected error for cycle, got nil")
 	}
+}
+
+// --- runner robustness: activity mapping, turn classification, starting status ---
+
+func TestToStoreActivity(t *testing.T) {
+	// Empty input -> nil (so SetActivity clears the feed).
+	if got := toStoreActivity(nil); got != nil {
+		t.Fatalf("nil input: got %v, want nil", got)
+	}
+	if got := toStoreActivity([]transcript.Activity{}); got != nil {
+		t.Fatalf("empty input: got %v, want nil", got)
+	}
+
+	in := []transcript.Activity{
+		{Kind: "tool", Tool: "Edit", Detail: "runner.go"},
+		{Kind: "text", Tool: "", Detail: "thinking"},
+	}
+	got := toStoreActivity(in)
+	if len(got) != len(in) {
+		t.Fatalf("len = %d, want %d", len(got), len(in))
+	}
+	for i, a := range in {
+		if got[i].Kind != a.Kind || got[i].Tool != a.Tool || got[i].Detail != a.Detail {
+			t.Errorf("row %d = %+v, want %+v", i, got[i], a)
+		}
+	}
+}
+
+// apply must classify a process-exit or empty turn as failed (not needs_input),
+// while a clean RAMBL_DONE marker still proceeds to the done path.
+func TestApplyClassifiesCrashAsFailed(t *testing.T) {
+	h := newHarness(t)
+
+	// (a) Process exited mid-turn -> failed, with the exit reason in the result.
+	h.addTask("crashed", nil)
+	w := worker.New(worker.Spec{})
+	h.r.apply(h.projectID, "crashed", w, worker.Turn{ProcessExited: true, ExitReason: "boom"})
+	got := h.get("crashed")
+	if got.Status != store.Failed {
+		t.Fatalf("ProcessExited: status = %s, want failed", got.Status)
+	}
+	if !strings.Contains(got.Result, "exited") || !strings.Contains(got.Result, "boom") {
+		t.Fatalf("ProcessExited: result %q missing exit reason", got.Result)
+	}
+
+	// (b) Empty reply (crashed immediately / no assistant message) -> failed,
+	// NOT needs_input.
+	h.addTask("silent", nil)
+	h.r.apply(h.projectID, "silent", worker.New(worker.Spec{}), worker.Turn{Reply: "   "})
+	got = h.get("silent")
+	if got.Status != store.Failed {
+		t.Fatalf("empty reply: status = %s, want failed", got.Status)
+	}
+	if !strings.Contains(got.Result, "no output") {
+		t.Fatalf("empty reply: result %q missing 'no output'", got.Result)
+	}
+
+	// (c) Clean RAMBL_DONE must NOT be caught by the new guards — it proceeds to
+	// the done path (Commit on a real, change-free worktree is a no-op success).
+	h.addTask("finished", nil)
+	wt := h.addWorktree("finished")
+	dw := worker.New(worker.Spec{})
+	dw.Worktree = wt
+	h.r.apply(h.projectID, "finished", dw, worker.Turn{Reply: "RAMBL_DONE"})
+	got = h.get("finished")
+	if got.Status != store.Done {
+		t.Fatalf("RAMBL_DONE: status = %s, want done", got.Status)
+	}
+	if strings.Contains(got.Result, "exited") || strings.Contains(got.Result, "no output") {
+		t.Fatalf("RAMBL_DONE: result %q was wrongly classified as a crash", got.Result)
+	}
+}
+
+// Dispatch must mark the task starting (not running): liveness is only claimed
+// once the REPL is live, which start() does after w.Start succeeds.
+func TestDispatchSetsStarting(t *testing.T) {
+	h := newHarness(t)
+	h.addTask("spawn", nil)
+
+	if err := h.r.Dispatch(h.projectID, "spawn"); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	// Read immediately: the background start() can only flip starting->running
+	// AFTER w.Start succeeds, which it cannot here (selfExe=="" -> no session).
+	if got := h.get("spawn").Status; got != store.Starting {
+		t.Fatalf("status after Dispatch = %s, want starting", got)
+	}
+
+	// Retire the background worker so it doesn't outlive the test.
+	h.r.retire("spawn")
 }
